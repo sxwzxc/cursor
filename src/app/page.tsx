@@ -76,6 +76,8 @@ export default function Home() {
   const [updateResult, setUpdateResult] = useState<UpdateResult | null>(null);
   const [error, setError] = useState<string>("");
   const [elapsed, setElapsed] = useState(0);
+  const [downloadProgress, setDownloadProgress] = useState<{ received: number; total: number; fileName: string } | null>(null);
+  const [downloading, setDownloading] = useState(false);
 
   const handleCheck = async () => {
     setChecking(true);
@@ -117,8 +119,95 @@ export default function Home() {
     }
   };
 
-  const handleDownload = () => {
-    window.location.href = `/koa/api/download?platform=${platform}`;
+  const handleDownload = async () => {
+    setError("");
+    setDownloading(true);
+    setDownloadProgress(null);
+    setElapsed(0);
+    const start = Date.now();
+    const timer = setInterval(() => setElapsed(Date.now() - start), 500);
+    try {
+      // 1. Fetch the manifest describing how to reassemble the installer.
+      const manifestResp = await fetch(`/koa/api/download-manifest?platform=${platform}`);
+      const manifest = await manifestResp.json();
+      if (!manifestResp.ok) throw new Error(manifest.detail || manifest.error || "获取下载清单失败");
+      const { fileName, fileSize, chunkCount, chunks } = manifest as {
+        fileName: string;
+        fileSize: number;
+        chunkCount: number;
+        chunks: { index: number; url: string; size: number }[];
+      };
+
+      // 2. Try the File System Access API (Chromium) to stream straight to
+      // disk without holding 177 MB in memory.
+      const w = window as unknown as {
+        showSaveFilePicker?: (opts: {
+          suggestedName?: string;
+          types?: { description?: string; accept: Record<string, string[]> }[];
+        }) => Promise<FileSystemFileHandle>;
+      };
+      if (typeof w.showSaveFilePicker === "function") {
+        let handle: FileSystemFileHandle;
+        try {
+          handle = await w.showSaveFilePicker({
+            suggestedName: fileName,
+            types: [
+              {
+                description: "Installer",
+                accept: { "application/octet-stream": [".exe", ".dmg", ".AppImage"] },
+              },
+            ],
+          });
+        } catch (e) {
+          // User cancelled the picker — abort cleanly.
+          if (e instanceof DOMException && e.name === "AbortError") return;
+          throw e;
+        }
+        const writable = await (handle as unknown as { createWritable: () => Promise<FileSystemWritableFileStream> }).createWritable();
+        let received = 0;
+        for (const chunk of chunks) {
+          const r = await fetch(chunk.url);
+          if (!r.ok) throw new Error(`分片 ${chunk.index} 下载失败: HTTP ${r.status}`);
+          const buf = await r.arrayBuffer();
+          await writable.write(buf);
+          received += buf.byteLength;
+          setElapsed(Date.now() - start);
+        }
+        await writable.close();
+        setDownloadProgress({ received: fileSize, total: fileSize, fileName });
+        return;
+      }
+
+      // 3. Fallback: fetch all chunks into memory, then trigger a Blob download.
+      // Holds the full file in memory — fine for desktop browsers on a 177 MB file.
+      const parts: BlobPart[] = [];
+      let received = 0;
+      for (const chunk of chunks) {
+        const r = await fetch(chunk.url);
+        if (!r.ok) throw new Error(`分片 ${chunk.index} 下载失败: HTTP ${r.status}`);
+        const buf = await r.arrayBuffer();
+        parts.push(buf);
+        received += buf.byteLength;
+        setDownloadProgress({ received, total: fileSize, fileName });
+        setElapsed(Date.now() - start);
+      }
+      const blob = new Blob(parts, { type: "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 30000);
+      void chunkCount;
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "下载失败");
+    } finally {
+      clearInterval(timer);
+      setElapsed(0);
+      setUpdating(false);
+    }
   };
 
   const onPlatformChange = (id: string) => {

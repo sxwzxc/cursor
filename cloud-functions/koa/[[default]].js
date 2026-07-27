@@ -288,7 +288,9 @@ router.get('/', (ctx) => {
       'GET /api/status?platform=<id>': 'Return cached metadata (or null)',
       'GET /api/check?platform=<id>': 'Compare latest vs cached; returns needsUpdate flag',
       'POST /api/update?platform=<id>&force=<true|false>': 'If newer (or force), delete old chunks, download, re-chunk, save meta. Otherwise skip.',
-      'GET /api/download?platform=<id>': 'Stream the cached installer (reassembled from chunks)',
+      'GET /api/download-manifest?platform=<id>': 'Chunk manifest (use this + /api/download-chunk to fetch the installer)',
+      'GET /api/download-chunk?platform=<id>&index=<n>': 'Fetch a single 24 MB chunk (avoids the function response size cap)',
+      'GET /api/download?platform=<id>': 'Legacy single-shot stream — will 413 for large files; prefer the manifest flow',
     },
   };
 });
@@ -455,6 +457,114 @@ router.post('/api/update', async (ctx) => {
   };
 });
 
+// Serve a single chunk. EdgeOne Pages Functions cap the response payload
+// (CLOUD_FUNCTION_PAYLOAD_TOO_LARGE), so we cannot stream the whole 177 MB
+// installer through one response. The browser fetches each chunk separately
+// and concatenates them client-side.
+router.get('/api/download-chunk', async (ctx) => {
+  const platform = ctx.query.platform;
+  const indexRaw = ctx.query.index;
+  if (!isValidPlatform(platform)) {
+    ctx.status = 400;
+    ctx.body = { error: 'invalid_platform' };
+    return;
+  }
+  const index = parseInt(indexRaw, 10);
+  if (!Number.isFinite(index) || index < 0) {
+    ctx.status = 400;
+    ctx.body = { error: 'invalid_index', detail: 'index must be a non-negative integer' };
+    return;
+  }
+
+  const meta = await getCachedMeta(platform);
+  if (!meta) {
+    ctx.status = 404;
+    ctx.body = {
+      error: 'no_cached_version',
+      detail: 'POST /api/update?platform=<id> to download the installer first.',
+    };
+    return;
+  }
+  if (index >= meta.chunkCount) {
+    ctx.status = 404;
+    ctx.body = { error: 'chunk_out_of_range', detail: `index ${index} >= chunkCount ${meta.chunkCount}` };
+    return;
+  }
+
+  const store = getStoreInstance();
+  const buf = await store.get(`chunks/${platform}/${index}`, { type: 'arrayBuffer' });
+  if (!buf) {
+    ctx.status = 410;
+    ctx.body = {
+      error: 'chunk_missing',
+      detail: `chunk ${index} not found; run POST /api/update?platform=${platform}&force=true to repair`,
+    };
+    return;
+  }
+
+  // Per-chunk headers so the client can verify integrity as it goes.
+  const start = index * meta.chunkSize;
+  const end = Math.min(start + meta.chunkSize - 1, meta.fileSize - 1);
+  ctx.set('Content-Type', 'application/octet-stream');
+  ctx.set('Content-Length', String(buf.byteLength));
+  ctx.set('Content-Disposition', `attachment; filename="chunk-${index}"`);
+  ctx.set('X-Cursor-Version', meta.version || 'unknown');
+  ctx.set('X-Cursor-Commit', meta.commit || 'unknown');
+  ctx.set('X-Cursor-Chunk-Index', String(index));
+  ctx.set('X-Cursor-Chunk-Total', String(meta.chunkCount));
+  ctx.set('X-Cursor-Chunk-Start', String(start));
+  ctx.set('X-Cursor-Chunk-End', String(end));
+  ctx.set('X-Cursor-Chunk-Size', String(buf.byteLength));
+  ctx.set('X-Cursor-File-Size', String(meta.fileSize));
+  ctx.set('X-Cursor-File-Name', meta.fileName || '');
+  ctx.set('Cache-Control', 'public, max-age=3600');
+
+  ctx.body = Buffer.from(buf);
+});
+
+// Manifest describing how to reassemble the cached installer from chunks.
+// The browser reads this first, then fetches each /api/download-chunk.
+router.get('/api/download-manifest', async (ctx) => {
+  const platform = ctx.query.platform;
+  if (!isValidPlatform(platform)) {
+    ctx.status = 400;
+    ctx.body = { error: 'invalid_platform' };
+    return;
+  }
+  const meta = await getCachedMeta(platform);
+  if (!meta) {
+    ctx.status = 404;
+    ctx.body = {
+      error: 'no_cached_version',
+      detail: 'POST /api/update?platform=<id> to download the installer first.',
+    };
+    return;
+  }
+  const chunks = [];
+  for (let i = 0; i < meta.chunkCount; i++) {
+    const start = i * meta.chunkSize;
+    const end = Math.min(start + meta.chunkSize - 1, meta.fileSize - 1);
+    chunks.push({ index: i, start, end, size: end - start + 1, url: `/koa/api/download-chunk?platform=${platform}&index=${i}` });
+  }
+  ctx.set('Cache-Control', 'no-store');
+  ctx.body = {
+    platform: meta.platform,
+    version: meta.version,
+    commit: meta.commit,
+    fileName: meta.fileName,
+    fileSize: meta.fileSize,
+    contentType: meta.contentType,
+    chunkCount: meta.chunkCount,
+    chunkSize: meta.chunkSize,
+    cachedAt: meta.cachedAt,
+    sourceUrl: meta.sourceUrl,
+    chunks,
+  };
+});
+
+// Legacy single-shot download — kept for compatibility, but will fail with
+// CLOUD_FUNCTION_PAYLOAD_TOO_LARGE for installers bigger than the function
+// response cap. Clients should use /api/download-manifest + /api/download-chunk.
 router.get('/api/download', async (ctx) => {
   const platform = ctx.query.platform;
   if (!isValidPlatform(platform)) {
