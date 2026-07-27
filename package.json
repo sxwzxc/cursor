@@ -9,6 +9,7 @@
     "lint": "next lint"
   },
   "dependencies": {
+    "@edgeone/pages-blob": "^0.0.12",
     "@koa/router": "^14.0.0",
     "@radix-ui/react-slot": "^1.2.3",
     "class-variance-authority": "^0.7.1",
