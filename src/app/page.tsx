@@ -515,8 +515,11 @@ GET  /koa/api/platforms        平台列表
 GET  /koa/api/latest?platform=  官方最新版信息
 GET  /koa/api/status?platform=  镜像站缓存信息
 GET  /koa/api/check?platform=   对比最新版与缓存
-POST /koa/api/update?platform=  检查并按需更新（force=true 强制）
-GET  /koa/api/download?platform= 下载缓存的安装包`}
+POST /koa/api/update-step?platform=  下载一个分片（前端循环调用）
+POST /koa/api/auto-update?platform=   自动检查+下载（定时任务用）
+GET  /koa/api/download-manifest?platform=  分片清单
+GET  /koa/api/download-chunk?platform=&index=  下载单个分片
+GET  /koa/api/changelog?force=<bool>   获取并缓存更新日志`}
             </pre>
           </CardContent>
         </Card>

@@ -1,0 +1,68 @@
+# 每天 0:00 (北京时间 = UTC 16:00) 自动检查并缓存 Cursor Windows 最新版。
+# GitHub Actions cron 使用 UTC，所以 cron 表达式为 "0 16 * * *"。
+# 注意：GitHub Actions cron 不保证准时，可能有最多 30 分钟的延迟。
+name: Daily Auto-Update Cursor
+
+on:
+  schedule:
+    # UTC 16:00 = Beijing 00:00 (next day)
+    - cron: '0 16 * * *'
+  # 允许手动触发，用于测试
+  workflow_dispatch:
+
+jobs:
+  auto-update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Trigger auto-update loop
+        run: |
+          set -euo pipefail
+          BASE_URL="https://cursor.sxwzxc.cn/koa/api/auto-update?platform=win32-x64-user"
+          MAX_CALLS=30
+          echo "=== Starting auto-update loop (max $MAX_CALLS calls) ==="
+          for i in $(seq 1 $MAX_CALLS); do
+            echo "--- Call $i / $MAX_CALLS ---"
+            RESPONSE=$(curl -sS -m 30 -X POST "$BASE_URL" 2>&1) || {
+              echo "curl failed, retrying in 10s..."
+              sleep 10
+              continue
+            }
+            # Parse the response
+            ACTION=$(echo "$RESPONSE" | python3 -c "import sys,json; print(json.load(sys.stdin).get('action','error'))" 2>/dev/null || echo "parse_error")
+            if [ "$ACTION" = "parse_error" ]; then
+              echo "Failed to parse response, raw:"
+              echo "$RESPONSE" | head -c 500
+              sleep 5
+              continue
+            fi
+            # Print summary
+            echo "$RESPONSE" | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          p = d.get('progress', {})
+          c = d.get('cached', {})
+          print(f\"  action={d.get('action')} reason={d.get('reason','')}\")
+          print(f\"  version={c.get('version')} chunks={p.get('chunksDone')}/{p.get('chunksTotal')} bytes={p.get('bytesDownloaded')}/{p.get('bytesTotal')}\")
+          print(f\"  downloaded_this_call={d.get('chunksDownloadedThisCall',0)} duration={d.get('durationMs',0)}ms\")
+          if d.get('lastError'): print(f\"  lastError={d.get('lastError')}\")
+          " 2>/dev/null || echo "  (summary parse failed)"
+            # Check if done
+            if [ "$ACTION" = "skipped" ]; then
+              echo "=== Already up to date, done ==="
+              exit 0
+            fi
+            if [ "$ACTION" = "completed" ]; then
+              echo "=== Download completed successfully ==="
+              exit 0
+            fi
+            if [ "$ACTION" = "error" ]; then
+              echo "=== Server returned error, aborting ==="
+              echo "$RESPONSE" | head -c 500
+              exit 1
+            fi
+            # action = 'in_progress' — wait briefly then call again
+            sleep 3
+          done
+          echo "=== Reached max calls ($MAX_CALLS), stopping ==="
+          echo "The download may still be in progress; next scheduled run will continue."

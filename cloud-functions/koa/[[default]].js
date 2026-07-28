@@ -287,10 +287,12 @@ router.get('/', (ctx) => {
       'GET /api/latest?platform=<id>': 'Fetch latest version info from cursor.com',
       'GET /api/status?platform=<id>': 'Return cached metadata (or null)',
       'GET /api/check?platform=<id>': 'Compare latest vs cached; returns needsUpdate flag',
-      'POST /api/update?platform=<id>&force=<true|false>': 'If newer (or force), delete old chunks, download, re-chunk, save meta. Otherwise skip.',
+      'POST /api/update-step?platform=<id>&force=<bool>': 'Download ONE chunk per call (resumable, for frontend loop)',
+      'POST /api/auto-update?platform=<id>': 'Auto check + download within 25s budget (for cron). Loop until action=completed|skipped.',
       'GET /api/download-manifest?platform=<id>': 'Chunk manifest (use this + /api/download-chunk to fetch the installer)',
-      'GET /api/download-chunk?platform=<id>&index=<n>': 'Fetch a single 24 MB chunk (avoids the function response size cap)',
+      'GET /api/download-chunk?platform=<id>&index=<n>': 'Fetch a single chunk (avoids the function response size cap)',
       'GET /api/download?platform=<id>': 'Legacy single-shot stream — will 413 for large files; prefer the manifest flow',
+      'GET /api/changelog?force=<bool>': 'Fetch and cache the cursor.com changelog page as text',
     },
   };
 });
@@ -607,6 +609,190 @@ router.get('/api/download', async (ctx) => {
   }
 
   ctx.body = Readable.from(reassemble());
+});
+
+// ---------- Auto-update (for GitHub Actions cron) ----------
+
+// POST /api/auto-update?platform=<id>
+// Designed to be called repeatedly by an external scheduler (GitHub Actions).
+// Each invocation:
+//   1. If no download in progress, checks cursor.com for the latest version.
+//   2. If an update is needed, starts/resumes the chunked download.
+//   3. Downloads as many chunks as possible within a 25s time budget.
+//   4. Returns the current state so the caller knows whether to call again.
+//
+// The caller loops until response.action is 'skipped' or 'completed'.
+// This avoids the 30s function cap: each call does a bounded amount of work.
+router.post('/api/auto-update', async (ctx) => {
+  const platform = ctx.query.platform || 'win32-x64-user';
+  if (!isValidPlatform(platform)) {
+    ctx.status = 400;
+    ctx.body = { error: 'invalid_platform' };
+    return;
+  }
+
+  const startedAt = Date.now();
+  // 25s budget — leaves ~5s buffer under EdgeOne's 30s function cap.
+  const TIME_BUDGET_MS = 25000;
+
+  // ---- Phase 1: Check if we need to update ----
+  // Only do the (slow) cursor.com HEAD if there's no download already in
+  // progress. If status='downloading', skip straight to resuming chunks.
+  let cached = await getCachedMeta(platform);
+  const isInProgress = cached && cached.status === 'downloading'
+    && cached.commit && cached.sourceUrl
+    && cached.chunkSize === CHUNK_SIZE;
+
+  let latest = null;
+  let needsUpdate = true;
+  let checkSkipped = false;
+
+  if (isInProgress) {
+    // Resume — don't re-check cursor.com, just keep downloading chunks.
+    checkSkipped = true;
+  } else {
+    try {
+      latest = await getLatestVersionInfo(platform);
+    } catch (e) {
+      ctx.status = 502;
+      ctx.body = {
+        action: 'error',
+        error: 'fetch_latest_failed',
+        detail: describeFetchError(e),
+        durationMs: Date.now() - startedAt,
+      };
+      return;
+    }
+    cached = await getCachedMeta(platform);
+    const ready = cached && cached.status === 'ready';
+    const sameCommit = ready && latest.commit && cached.commit === latest.commit;
+    if (sameCommit) {
+      // Already up to date.
+      ctx.body = {
+        action: 'skipped',
+        reason: 'already_latest',
+        latest,
+        cached,
+        progress: {
+          chunksDone: cached.chunksDone ? cached.chunksDone.length : cached.chunkCount,
+          chunksTotal: cached.chunkCount,
+          bytesDownloaded: cached.fileSize,
+          bytesTotal: cached.fileSize,
+          chunkIndex: -1,
+        },
+        durationMs: Date.now() - startedAt,
+      };
+      return;
+    }
+    // Need to start a fresh download.
+    let totalSize, chunkCount;
+    try {
+      ({ totalSize, chunkCount } = await probeRangeSupport(latest.url));
+    } catch (e) {
+      ctx.status = 502;
+      ctx.body = {
+        action: 'error',
+        error: 'probe_failed',
+        detail: describeFetchError(e),
+        durationMs: Date.now() - startedAt,
+      };
+      return;
+    }
+    try { await deleteOldChunks(platform); } catch (_) {}
+    cached = {
+      status: 'downloading',
+      platform,
+      version: latest.version,
+      commit: latest.commit,
+      fileName: latest.fileName,
+      fileSize: totalSize,
+      chunkCount,
+      chunkSize: CHUNK_SIZE,
+      contentType: latest.contentType,
+      sourceUrl: latest.url,
+      sourceLastModified: latest.lastModified,
+      chunksDone: [],
+      cachedAt: new Date().toISOString(),
+      completedAt: null,
+    };
+    await saveCachedMeta(platform, cached);
+  }
+
+  // ---- Phase 2: Download chunks within the time budget ----
+  const chunksDoneSet = new Set(cached.chunksDone || []);
+  let chunksDownloadedThisCall = 0;
+  let consecutiveFailures = 0;
+  let lastError = null;
+
+  for (let i = 0; i < cached.chunkCount; i++) {
+    // Time budget check — stop if we're running low.
+    if (Date.now() - startedAt > TIME_BUDGET_MS) {
+      break;
+    }
+    if (chunksDoneSet.has(i)) continue;
+
+    try {
+      const range = await downloadSingleChunk(
+        platform, cached.sourceUrl, i, cached.fileSize, cached.chunkSize
+      );
+      cached.chunksDone.push(i);
+      chunksDoneSet.add(i);
+      chunksDownloadedThisCall++;
+      consecutiveFailures = 0;
+      // Persist progress after each chunk so a crash doesn't lose work.
+      await saveCachedMeta(platform, cached);
+    } catch (e) {
+      lastError = e;
+      consecutiveFailures++;
+      // If we fail 5 times in a row, abort this call — the scheduler will
+      // retry. Persisting what we have so far.
+      if (consecutiveFailures >= 5) {
+        break;
+      }
+      // Brief pause before retrying the next chunk.
+      await sleep(1000);
+    }
+  }
+
+  // ---- Phase 3: Check if we're done ----
+  const allDone = cached.chunksDone.length >= cached.chunkCount;
+  if (allDone) {
+    cached.status = 'ready';
+    cached.completedAt = new Date().toISOString();
+    await saveCachedMeta(platform, cached);
+  }
+
+  // Refresh latest info if we skipped the check (for the response).
+  if (!latest) {
+    latest = metaToLatest(cached);
+  }
+
+  const bytesDownloaded = sumBytesDone(cached);
+  const durationMs = Date.now() - startedAt;
+
+  ctx.body = {
+    action: allDone ? 'completed' : 'in_progress',
+    reason: allDone
+      ? 'all_chunks_downloaded'
+      : checkSkipped
+        ? 'resumed_download'
+        : 'started_download',
+    latest,
+    cached,
+    progress: {
+      chunksDone: cached.chunksDone.length,
+      chunksTotal: cached.chunkCount,
+      bytesDownloaded,
+      bytesTotal: cached.fileSize,
+      chunkIndex: -1,
+    },
+    chunksDownloadedThisCall,
+    consecutiveFailures,
+    lastError: lastError ? describeFetchError(lastError) : null,
+    durationMs,
+    // Tell the caller whether to loop again.
+    callAgain: !allDone,
+  };
 });
 
 app.use(router.routes());
