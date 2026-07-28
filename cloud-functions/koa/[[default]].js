@@ -6,39 +6,52 @@ import { getStore } from '@edgeone/pages-blob';
 // ---------- Configuration ----------
 
 const STORE_NAME = 'cursor-cache';
-// 24 MB per chunk — safely below the 25 MB single-blob limit
-const CHUNK_SIZE = 24 * 1024 * 1024;
+// 6 MB per chunk — comfortably below the 25 MB single-blob limit, and small
+// enough that one chunk downloads in ~3s even on a ~2 MB/s egress (EdgeOne ->
+// cursor.com observed bandwidth). This keeps each /api/update-step call well
+// under EdgeOne's ~30s function execution cap, with room for retries.
+// 199 MB installer -> ~34 chunks.
+const CHUNK_SIZE = 6 * 1024 * 1024;
 
-// Cursor official "golden" download API — /cursor/3.5 always redirects to the
-// newest 3.5.x build for the given platform. We follow the redirect and read
-// the production URL (which contains the commit hash + version) to detect
-// updates reliably across all platforms (macOS filenames don't include version).
+// Cursor official "golden" download API.
+// The path ends with `cursor/` (no version pin) — this always redirects to the
+// newest stable build for the platform (e.g. 3.13.10). Pinning to a version
+// like `cursor/3.5` would freeze us on the 3.5.x channel.
+// We follow the redirect and read the production URL (commit hash + version)
+// to detect updates reliably. macOS filenames don't include a version, so we
+// fall back to the Windows URL to resolve a version label for the same commit.
 const PLATFORMS = {
   'win32-x64-user': {
     label: 'Windows x64 (User Setup)',
     fileExt: '.exe',
     contentType: 'application/x-msdos-program',
-    url: 'https://api2.cursor.sh/updates/download/golden/win32-x64-user/cursor/3.5',
+    url: 'https://api2.cursor.sh/updates/download/golden/win32-x64-user/cursor/',
   },
   'darwin-arm64': {
     label: 'macOS Apple Silicon (ARM64)',
     fileExt: '.dmg',
     contentType: 'application/x-apple-diskimage',
-    url: 'https://api2.cursor.sh/updates/download/golden/darwin-arm64/cursor/3.5',
+    url: 'https://api2.cursor.sh/updates/download/golden/darwin-arm64/cursor/',
   },
   'darwin-x64': {
     label: 'macOS Intel (x64)',
     fileExt: '.dmg',
     contentType: 'application/x-apple-diskimage',
-    url: 'https://api2.cursor.sh/updates/download/golden/darwin-x64/cursor/3.5',
+    url: 'https://api2.cursor.sh/updates/download/golden/darwin-x64/cursor/',
   },
   'linux-x64': {
     label: 'Linux x64 (AppImage)',
     fileExt: '.AppImage',
     contentType: 'binary/octet-stream',
-    url: 'https://api2.cursor.sh/updates/download/golden/linux-x64/cursor/3.5',
+    url: 'https://api2.cursor.sh/updates/download/golden/linux-x64/cursor/',
   },
 };
+
+// Used as a version-label fallback for platforms whose redirect URL has no
+// semver (macOS .dmg filenames are just "Cursor-darwin-arm64.dmg"). All
+// platforms on the same release share the same commit, so we can borrow the
+// version string from the Windows redirect.
+const VERSION_PROBE_PLATFORM = 'win32-x64-user';
 
 // ---------- Helpers ----------
 
@@ -67,14 +80,43 @@ function describeFetchError(err) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Retry a fetch operation a few times with exponential backoff. The EdgeOne
-// egress to cursor.com is flaky — a single request often fails with a generic
-// "fetch failed", but a retry a second later succeeds.
-async function fetchWithRetry(url, opts = {}, { tries = 4, baseMs = 800 } = {}) {
+// Wrap fetch with an AbortController timeout. Without this, a hung connection
+// to cursor.com blocks the whole function until EdgeOne's 30s cap kills it,
+// leaving no time for a retry. Aborting throws an AbortError which the caller's
+// retry loop catches.
+async function fetchWithTimeout(url, opts = {}, ms = 8000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...opts, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Read the response body as an ArrayBuffer, but bail out if it takes longer
+// than `ms`. The fetch AbortController only covers the header phase; once
+// headers arrive, a slow body stream can still hang us. We poll the promise
+// against a timer and reject if it doesn't resolve in time.
+function readBodyWithTimeout(resp, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`body read timed out after ${ms}ms`)), ms);
+    resp.arrayBuffer().then(
+      (buf) => { clearTimeout(timer); resolve(buf); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
+}
+
+// Retry a fetch operation a few times with exponential backoff + a per-attempt
+// timeout. The EdgeOne egress to cursor.com is flaky — a single request often
+// hangs or fails with a generic "fetch failed", but a retry a second later
+// succeeds.
+async function fetchWithRetry(url, opts = {}, { tries = 4, baseMs = 800, timeoutMs = 8000 } = {}) {
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try {
-      const resp = await fetch(url, opts);
+      const resp = await fetchWithTimeout(url, opts, timeoutMs);
       return resp;
     } catch (e) {
       lastErr = e;
@@ -86,7 +128,7 @@ async function fetchWithRetry(url, opts = {}, { tries = 4, baseMs = 800 } = {}) 
 
 // Parse the redirected production URL into a fingerprint we can compare.
 // Example URL:
-//   https://downloads.cursor.com/production/009bb5a3.../win32/x64/user-setup/CursorUserSetup-x64-3.5.38.exe
+//   https://downloads.cursor.com/production/009bb5a3.../win32/x64/user-setup/CursorUserSetup-x64-3.13.10.exe
 function parseVersionInfo(url) {
   let commit = null;
   let version = null;
@@ -129,9 +171,26 @@ async function getLatestVersionInfo(platform) {
   const info = parseVersionInfo(finalUrl);
   const contentLength = resp.headers.get('content-length');
   const fileSize = contentLength ? parseInt(contentLength, 10) : 0;
+
+  let version = info.version;
+  // macOS .dmg filenames don't carry a version, so the URL has no semver.
+  // Fall back to the Windows redirect for the same release (shared commit).
+  if (!version && platform !== VERSION_PROBE_PLATFORM) {
+    try {
+      const probe = PLATFORMS[VERSION_PROBE_PLATFORM];
+      const probeResp = await fetchWithRetry(probe.url, { method: 'HEAD', redirect: 'follow', headers: FETCH_HEADERS });
+      if (probeResp.ok) {
+        const probeInfo = parseVersionInfo(probeResp.url || '');
+        version = probeInfo.version || null;
+      }
+    } catch (_) {
+      // Non-fatal — version label is cosmetic; commit comparison still works.
+    }
+  }
+
   return {
     platform,
-    version: info.version,
+    version,
     commit: info.commit,
     fileName: info.fileName || `cursor-${platform}${cfg.fileExt}`,
     fileSize,
@@ -167,24 +226,13 @@ async function deleteOldChunks(platform) {
   return blobs.length;
 }
 
-// Download using HTTP Range requests, one CHUNK_SIZE slice at a time.
-// Each slice is fetched independently with its own retry, so a flaky egress
-// can't kill the whole 177 MB download — only the failing slice is retried.
-// Returns { chunkCount, totalSize, ranges: [...] }.
-async function downloadAndChunk(platform, latestInfo) {
-  const store = getStoreInstance();
-  const totalSize = latestInfo.fileSize && latestInfo.fileSize > 0
-    ? latestInfo.fileSize
-    : 0;
-
-  if (!totalSize) {
-    throw new Error('Cannot range-download: latest.fileSize is unknown (cursor.com did not return Content-Length).');
-  }
-
-  // downloads.cursor.com is fronted by CloudFront and supports Range requests.
-  // We double-check by probing with a 0-0 range; if the server ignores Range
-  // we abort early and let the caller show a clear error.
-  const probeResp = await fetchWithRetry(latestInfo.url, {
+// Probe the download URL with a 0-byte Range request to:
+//  1. confirm the CDN honours Range (we need this to chunk the download);
+//  2. read the true total size from Content-Range (more reliable than the
+//     Content-Length on the HEAD response, which can be absent on redirects).
+// Returns { totalSize, chunkCount }. Throws if Range is unsupported.
+async function probeRangeSupport(url) {
+  const probeResp = await fetchWithRetry(url, {
     method: 'GET',
     headers: { ...FETCH_HEADERS, Range: 'bytes=0-0' },
     redirect: 'follow',
@@ -192,61 +240,83 @@ async function downloadAndChunk(platform, latestInfo) {
   if (probeResp.status !== 206) {
     throw new Error(`Range requests not supported (probe returned HTTP ${probeResp.status}). Cannot safely chunk-download.`);
   }
-  const acceptRanges = probeResp.headers.get('accept-ranges');
   const contentRange = probeResp.headers.get('content-range') || '';
   const declaredTotal = contentRange.match(/\/(\d+)/);
-  if (declaredTotal && parseInt(declaredTotal[1], 10) !== totalSize) {
-    // Trust the content-range; update the size we use for chunking.
-    latestInfo.fileSize = parseInt(declaredTotal[1], 10);
-  }
-  // Close probe body to free the connection.
   try { await probeResp.body.cancel(); } catch (_) {}
+  const totalSize = declaredTotal ? parseInt(declaredTotal[1], 10) : 0;
+  if (!totalSize) throw new Error('Could not determine total size from Content-Range.');
+  return { totalSize, chunkCount: Math.ceil(totalSize / CHUNK_SIZE) };
+}
 
-  const finalTotal = latestInfo.fileSize;
-  const chunkCount = Math.ceil(finalTotal / CHUNK_SIZE);
-  const ranges = [];
+// Download a single slice via HTTP Range and write it to blob storage.
+// Single attempt per call — on failure, throws so the caller can retry.
+// `chunkSize` is read from the cached meta (not the constant) so that an
+// in-flight download keeps its original chunk boundaries even if CHUNK_SIZE
+// is later changed.
+async function downloadSingleChunk(platform, url, index, totalSize, chunkSize) {
+  const store = getStoreInstance();
+  const sz = chunkSize || CHUNK_SIZE;
+  const start = index * sz;
+  const end = Math.min(start + sz - 1, totalSize - 1);
+  const expected = end - start + 1;
 
-  for (let i = 0; i < chunkCount; i++) {
-    const start = i * CHUNK_SIZE;
-    // Range end is inclusive.
-    const end = Math.min(start + CHUNK_SIZE - 1, finalTotal - 1);
-
-    let buf = null;
-    let lastErr;
-    for (let attempt = 0; attempt < 4; attempt++) {
-      try {
-        const resp = await fetch(latestInfo.url, {
-          method: 'GET',
-          headers: { ...FETCH_HEADERS, Range: `bytes=${start}-${end}` },
-          redirect: 'follow',
-        });
-        if (!resp.ok && resp.status !== 206 && resp.status !== 200) {
-          throw new Error(`HTTP ${resp.status} for range ${start}-${end}`);
-        }
-        buf = await resp.arrayBuffer();
-        if (!buf || buf.byteLength === 0) {
-          throw new Error('empty body for range');
-        }
-        // CloudFront may return fewer bytes than requested on the last chunk;
-        // that's fine. For non-final chunks, verify size.
-        if (i < chunkCount - 1 && buf.byteLength !== (end - start + 1)) {
-          throw new Error(`short read: expected ${end - start + 1}, got ${buf.byteLength}`);
-        }
-        break;
-      } catch (e) {
-        lastErr = e;
-        if (attempt < 3) await sleep(800 * Math.pow(2, attempt));
-      }
+  let buf = null;
+  // 8s per-attempt timeout. With 6 MB chunks at ~2 MB/s, a normal download
+  // takes ~3s, so this only fires on genuine stalls.
+  const FETCH_TIMEOUT_MS = 8000;
+  try {
+    const resp = await fetchWithTimeout(url, {
+      method: 'GET',
+      headers: { ...FETCH_HEADERS, Range: `bytes=${start}-${end}` },
+      redirect: 'follow',
+    }, FETCH_TIMEOUT_MS);
+    if (resp.status !== 206 && resp.status !== 200) {
+      throw new Error(`HTTP ${resp.status} for range ${start}-${end}`);
     }
-    if (!buf) {
-      throw new Error(`chunk ${i} (${start}-${end}) failed after retries: ${describeFetchError(lastErr)}`);
+    buf = await readBodyWithTimeout(resp, FETCH_TIMEOUT_MS);
+    if (!buf || buf.byteLength === 0) {
+      throw new Error('empty body for range');
     }
-
-    await store.set(`chunks/${platform}/${i}`, buf);
-    ranges.push({ index: i, start, end, size: buf.byteLength });
+    // The final chunk may be shorter than CHUNK_SIZE; everything else must
+    // be exactly the requested size, otherwise the reassembled file would
+    // be corrupt.
+    if (buf.byteLength !== expected && end !== totalSize - 1) {
+      throw new Error(`short read: expected ${expected}, got ${buf.byteLength}`);
+    }
+  } catch (e) {
+    throw new Error(`chunk ${index} (${start}-${end}) failed: ${describeFetchError(e)}`);
   }
 
-  return { chunkCount, totalSize: finalTotal, ranges };
+  await store.set(`chunks/${platform}/${index}`, buf);
+  return { index, start, end, size: buf.byteLength };
+}
+
+// Sum the actual bytes covered by chunksDone (the last chunk is shorter).
+function sumBytesDone(meta) {
+  if (!meta || !meta.chunksDone || !meta.chunkCount) return 0;
+  let total = 0;
+  for (const idx of meta.chunksDone) {
+    total += idx === meta.chunkCount - 1
+      ? (meta.fileSize - idx * meta.chunkSize)
+      : meta.chunkSize;
+  }
+  return Math.max(0, Math.min(total, meta.fileSize));
+}
+
+// Build a minimal LatestInfo object from cached meta, for responses on the
+// fast path where we skipped the cursor.com HEAD.
+function metaToLatest(meta) {
+  return {
+    platform: meta.platform,
+    version: meta.version,
+    commit: meta.commit,
+    fileName: meta.fileName,
+    fileSize: meta.fileSize,
+    url: meta.sourceUrl,
+    contentType: meta.contentType,
+    lastModified: meta.sourceLastModified,
+    fetchedAt: meta.cachedAt,
+  };
 }
 
 // ---------- Koa setup ----------
@@ -342,32 +412,45 @@ router.get('/api/check', async (ctx) => {
     return;
   }
   const startedAt = Date.now();
+  let latest;
   try {
-    const latest = await getLatestVersionInfo(platform);
-    const cached = await getCachedMeta(platform);
-    const sameCommit = cached && latest.commit && cached.commit === latest.commit;
-    const needsUpdate = !sameCommit;
-    let reason;
-    if (!cached) reason = 'no_cached_version';
-    else if (!latest.commit) reason = 'no_commit_on_latest';
-    else if (sameCommit) reason = 'up_to_date';
-    else reason = 'new_version_available';
-    ctx.body = {
-      latest,
-      cached,
-      needsUpdate,
-      reason,
-      durationMs: Date.now() - startedAt,
-    };
+    latest = await getLatestVersionInfo(platform);
   } catch (e) {
     ctx.status = 502;
-    ctx.body = { error: 'check_failed', detail: describeFetchError(e) };
+    ctx.body = { error: 'fetch_latest_failed', detail: describeFetchError(e), durationMs: Date.now() - startedAt };
+    return;
   }
+  const cached = await getCachedMeta(platform);
+  const ready = cached && cached.status === 'ready';
+  const sameCommit = ready && latest.commit && cached.commit === latest.commit;
+  const needsUpdate = !sameCommit;
+  let reason;
+  if (needsUpdate) {
+    reason = !cached ? 'no_cache' : !ready ? 'download_incomplete' : 'new_version';
+  } else {
+    reason = 'up_to_date';
+  }
+  ctx.body = { latest, cached, needsUpdate, reason, durationMs: Date.now() - startedAt };
 });
 
-// Smart update — only re-download if needed, unless force=true.
-// This is the endpoint the "检查更新" button calls.
-router.post('/api/update', async (ctx) => {
+// Per-step update — downloads ONE chunk per invocation. This is the endpoint
+// the frontend calls in a loop: it dodges the EdgeOne function execution-time
+// cap (~30s) and gives natural progress reporting.
+//
+// State machine (persisted in meta/{platform}):
+//   - No meta, or meta.commit != latest.commit, or force:
+//       -> delete old chunks, write a fresh meta with status='downloading'
+//       -> return action='started' (no chunk fetched yet this call)
+//   - meta.status === 'downloading' and !force:
+//       -> FAST PATH: skip the cursor.com HEAD re-check and go straight to
+//          the next missing chunk.
+//       -> find the smallest chunk index not in chunksDone
+//       -> download + store that one chunk
+//       -> if all chunks done, flip status to 'ready' and set completedAt
+//       -> return action='chunk_done' | 'completed'
+//   - meta.status === 'ready' and meta.commit === latest.commit and !force:
+//       -> return action='skipped'
+router.post('/api/update-step', async (ctx) => {
   const platform = ctx.query.platform;
   const force = ctx.query.force === 'true' || ctx.query.force === '1';
   if (!isValidPlatform(platform)) {
@@ -377,7 +460,23 @@ router.post('/api/update', async (ctx) => {
   }
 
   const startedAt = Date.now();
-  let latest, cached;
+
+  // ---------- FAST PATH: resume an in-progress download ----------
+  let cached = await getCachedMeta(platform);
+  if (!force && cached && cached.status === 'downloading' && cached.commit && cached.sourceUrl
+      && cached.chunkSize === CHUNK_SIZE) {
+    const resumeResult = await resumeDownload(platform, cached, startedAt);
+    if (resumeResult.body) {
+      ctx.body = resumeResult.body;
+      return;
+    }
+    ctx.status = 502;
+    ctx.body = resumeResult.error || { error: 'resume_failed' };
+    return;
+  }
+
+  // ---------- SLOW PATH: re-check cursor.com (first call, force, or ready) ----------
+  let latest;
   try {
     latest = await getLatestVersionInfo(platform);
   } catch (e) {
@@ -387,229 +486,175 @@ router.post('/api/update', async (ctx) => {
   }
 
   cached = await getCachedMeta(platform);
-  const sameCommit = cached && latest.commit && cached.commit === latest.commit;
+  const ready = cached && cached.status === 'ready';
+  const sameCommit = ready && latest.commit && cached.commit === latest.commit;
 
+  // Already up to date — nothing to do.
   if (!force && sameCommit) {
     ctx.body = {
       action: 'skipped',
       reason: 'already_latest',
       latest,
       cached,
+      progress: {
+        chunksDone: cached.chunksDone ? cached.chunksDone.length : cached.chunkCount,
+        chunksTotal: cached.chunkCount,
+        bytesDownloaded: cached.fileSize,
+        bytesTotal: cached.fileSize,
+        chunkIndex: -1,
+      },
       durationMs: Date.now() - startedAt,
     };
     return;
   }
 
-  // Need to (re)download.
-  // 1. Drop cached meta first — if we crash mid-download, callers will see
-  //    "no cached version" and retry, instead of seeing a stale meta pointing
-  //    at chunks that no longer exist.
-  await deleteCachedMeta(platform);
+  // Start (or restart) a download for this commit.
+  const hadPreviousCache = !!cached;
+  const startFresh = !cached || cached.commit !== latest.commit || force
+    || cached.chunkSize !== CHUNK_SIZE;
+  if (startFresh) {
+    let totalSize, chunkCount;
+    try {
+      ({ totalSize, chunkCount } = await probeRangeSupport(latest.url));
+    } catch (e) {
+      ctx.status = 502;
+      ctx.body = { error: 'probe_failed', detail: describeFetchError(e), durationMs: Date.now() - startedAt };
+      return;
+    }
 
-  // 2. Delete any old chunks (from previous version, or partial leftovers
-  //    from a failed earlier attempt).
-  let deletedChunks = 0;
-  try {
-    deletedChunks = await deleteOldChunks(platform);
-  } catch (e) {
-    // listing may fail on an empty store; non-fatal
-  }
+    let deletedChunks = 0;
+    try { deletedChunks = await deleteOldChunks(platform); } catch (_) {}
 
-  // 3. Download + chunk
-  let chunkCount = 0;
-  let totalSize = 0;
-  try {
-    ({ chunkCount, totalSize } = await downloadAndChunk(platform, latest));
-  } catch (e) {
-    ctx.status = 502;
+    cached = {
+      status: 'downloading',
+      platform,
+      version: latest.version,
+      commit: latest.commit,
+      fileName: latest.fileName,
+      fileSize: totalSize,
+      chunkCount,
+      chunkSize: CHUNK_SIZE,
+      contentType: latest.contentType,
+      sourceUrl: latest.url,
+      sourceLastModified: latest.lastModified,
+      chunksDone: [],
+      cachedAt: new Date().toISOString(),
+      completedAt: null,
+    };
+    await saveCachedMeta(platform, cached);
+
     ctx.body = {
-      error: 'download_failed',
-      detail: describeFetchError(e),
+      action: 'started',
+      reason: force ? 'forced' : (!hadPreviousCache ? 'no_previous_cache' : 'new_version_available'),
       deletedChunks,
+      latest,
+      cached,
+      progress: {
+        chunksDone: 0,
+        chunksTotal: chunkCount,
+        bytesDownloaded: 0,
+        bytesTotal: totalSize,
+        chunkIndex: -1,
+      },
       durationMs: Date.now() - startedAt,
     };
     return;
   }
 
-  // 4. Save new metadata (atomic from the reader's perspective: once this
-  //    lands, the cache is consistent).
-  const newMeta = {
-    platform,
-    version: latest.version,
-    commit: latest.commit,
-    fileName: latest.fileName,
-    fileSize: totalSize,
-    chunkCount,
-    chunkSize: CHUNK_SIZE,
-    contentType: latest.contentType,
-    sourceUrl: latest.url,
-    sourceLastModified: latest.lastModified,
-    cachedAt: new Date().toISOString(),
-  };
-  await saveCachedMeta(platform, newMeta);
-
+  ctx.status = 500;
   ctx.body = {
-    action: 'updated',
-    reason: force ? 'forced' : (!cached ? 'no_previous_cache' : 'new_version_available'),
-    previousVersion: cached ? cached.version : null,
-    previousCommit: cached ? cached.commit : null,
-    deletedChunks,
-    latest: newMeta,
+    error: 'update_step_unreachable',
+    detail: 'No state transition matched. This indicates a bug in the state machine.',
     durationMs: Date.now() - startedAt,
   };
 });
 
-// Serve a single chunk. EdgeOne Pages Functions cap the response payload
-// (CLOUD_FUNCTION_PAYLOAD_TOO_LARGE), so we cannot stream the whole 177 MB
-// installer through one response. The browser fetches each chunk separately
-// and concatenates them client-side.
-router.get('/api/download-chunk', async (ctx) => {
-  const platform = ctx.query.platform;
-  const indexRaw = ctx.query.index;
-  if (!isValidPlatform(platform)) {
-    ctx.status = 400;
-    ctx.body = { error: 'invalid_platform' };
-    return;
-  }
-  const index = parseInt(indexRaw, 10);
-  if (!Number.isFinite(index) || index < 0) {
-    ctx.status = 400;
-    ctx.body = { error: 'invalid_index', detail: 'index must be a non-negative integer' };
-    return;
+// Resume helper: downloads the next missing chunk for an in-progress download.
+// Returns either { body } (success) or { error } (failure).
+async function resumeDownload(platform, cached, startedAt, latest) {
+  const chunksDoneSet = new Set(cached.chunksDone || []);
+  let nextIndex = -1;
+  for (let i = 0; i < cached.chunkCount; i++) {
+    if (!chunksDoneSet.has(i)) { nextIndex = i; break; }
   }
 
-  const meta = await getCachedMeta(platform);
-  if (!meta) {
-    ctx.status = 404;
-    ctx.body = {
-      error: 'no_cached_version',
-      detail: 'POST /api/update?platform=<id> to download the installer first.',
+  if (nextIndex === -1) {
+    cached.status = 'ready';
+    cached.completedAt = new Date().toISOString();
+    await saveCachedMeta(platform, cached);
+    return {
+      body: {
+        action: 'completed',
+        reason: 'already_downloaded',
+        latest: latest || metaToLatest(cached),
+        cached,
+        progress: {
+          chunksDone: cached.chunksDone.length,
+          chunksTotal: cached.chunkCount,
+          bytesDownloaded: cached.fileSize,
+          bytesTotal: cached.fileSize,
+          chunkIndex: -1,
+        },
+        durationMs: Date.now() - startedAt,
+      },
     };
-    return;
-  }
-  if (index >= meta.chunkCount) {
-    ctx.status = 404;
-    ctx.body = { error: 'chunk_out_of_range', detail: `index ${index} >= chunkCount ${meta.chunkCount}` };
-    return;
   }
 
-  const store = getStoreInstance();
-  const buf = await store.get(`chunks/${platform}/${index}`, { type: 'arrayBuffer' });
-  if (!buf) {
-    ctx.status = 410;
-    ctx.body = {
-      error: 'chunk_missing',
-      detail: `chunk ${index} not found; run POST /api/update?platform=${platform}&force=true to repair`,
+  let range;
+  try {
+    range = await downloadSingleChunk(platform, cached.sourceUrl, nextIndex, cached.fileSize, cached.chunkSize);
+  } catch (e) {
+    // Return action='retry' (HTTP 200) so the frontend loops again.
+    return {
+      body: {
+        action: 'retry',
+        reason: 'chunk_download_failed',
+        detail: describeFetchError(e),
+        latest: latest || metaToLatest(cached),
+        cached,
+        progress: {
+          chunksDone: cached.chunksDone.length,
+          chunksTotal: cached.chunkCount,
+          bytesDownloaded: sumBytesDone(cached),
+          bytesTotal: cached.fileSize,
+          chunkIndex: nextIndex,
+        },
+        durationMs: Date.now() - startedAt,
+      },
     };
-    return;
   }
 
-  // Per-chunk headers so the client can verify integrity as it goes.
-  const start = index * meta.chunkSize;
-  const end = Math.min(start + meta.chunkSize - 1, meta.fileSize - 1);
-  ctx.set('Content-Type', 'application/octet-stream');
-  ctx.set('Content-Length', String(buf.byteLength));
-  ctx.set('Content-Disposition', `attachment; filename="chunk-${index}"`);
-  ctx.set('X-Cursor-Version', meta.version || 'unknown');
-  ctx.set('X-Cursor-Commit', meta.commit || 'unknown');
-  ctx.set('X-Cursor-Chunk-Index', String(index));
-  ctx.set('X-Cursor-Chunk-Total', String(meta.chunkCount));
-  ctx.set('X-Cursor-Chunk-Start', String(start));
-  ctx.set('X-Cursor-Chunk-End', String(end));
-  ctx.set('X-Cursor-Chunk-Size', String(buf.byteLength));
-  ctx.set('X-Cursor-File-Size', String(meta.fileSize));
-  ctx.set('X-Cursor-File-Name', meta.fileName || '');
-  ctx.set('Cache-Control', 'public, max-age=3600');
+  cached.chunksDone.push(nextIndex);
+  const bytesDownloaded = sumBytesDone(cached);
 
-  ctx.body = Buffer.from(buf);
-});
+  let action = 'chunk_done';
+  if (cached.chunksDone.length >= cached.chunkCount) {
+    cached.status = 'ready';
+    cached.completedAt = new Date().toISOString();
+    action = 'completed';
+  }
+  await saveCachedMeta(platform, cached);
 
-// Manifest describing how to reassemble the cached installer from chunks.
-// The browser reads this first, then fetches each /api/download-chunk.
-router.get('/api/download-manifest', async (ctx) => {
-  const platform = ctx.query.platform;
-  if (!isValidPlatform(platform)) {
-    ctx.status = 400;
-    ctx.body = { error: 'invalid_platform' };
-    return;
-  }
-  const meta = await getCachedMeta(platform);
-  if (!meta) {
-    ctx.status = 404;
-    ctx.body = {
-      error: 'no_cached_version',
-      detail: 'POST /api/update?platform=<id> to download the installer first.',
-    };
-    return;
-  }
-  const chunks = [];
-  for (let i = 0; i < meta.chunkCount; i++) {
-    const start = i * meta.chunkSize;
-    const end = Math.min(start + meta.chunkSize - 1, meta.fileSize - 1);
-    chunks.push({ index: i, start, end, size: end - start + 1, url: `/koa/api/download-chunk?platform=${platform}&index=${i}` });
-  }
-  ctx.set('Cache-Control', 'no-store');
-  ctx.body = {
-    platform: meta.platform,
-    version: meta.version,
-    commit: meta.commit,
-    fileName: meta.fileName,
-    fileSize: meta.fileSize,
-    contentType: meta.contentType,
-    chunkCount: meta.chunkCount,
-    chunkSize: meta.chunkSize,
-    cachedAt: meta.cachedAt,
-    sourceUrl: meta.sourceUrl,
-    chunks,
+  return {
+    body: {
+      action,
+      reason: action === 'completed' ? 'all_chunks_done' : 'chunk_downloaded',
+      latest: latest || metaToLatest(cached),
+      cached,
+      progress: {
+        chunksDone: cached.chunksDone.length,
+        chunksTotal: cached.chunkCount,
+        bytesDownloaded,
+        bytesTotal: cached.fileSize,
+        chunkIndex: nextIndex,
+        chunkSize: range.size,
+        chunkStart: range.start,
+        chunkEnd: range.end,
+      },
+      durationMs: Date.now() - startedAt,
+    },
   };
-});
-
-// Legacy single-shot download — kept for compatibility, but will fail with
-// CLOUD_FUNCTION_PAYLOAD_TOO_LARGE for installers bigger than the function
-// response cap. Clients should use /api/download-manifest + /api/download-chunk.
-router.get('/api/download', async (ctx) => {
-  const platform = ctx.query.platform;
-  if (!isValidPlatform(platform)) {
-    ctx.status = 400;
-    ctx.body = { error: 'invalid_platform' };
-    return;
-  }
-
-  const meta = await getCachedMeta(platform);
-  if (!meta) {
-    ctx.status = 404;
-    ctx.body = {
-      error: 'no_cached_version',
-      detail: 'POST /api/update?platform=<id> to download the installer first.',
-    };
-    return;
-  }
-
-  const store = getStoreInstance();
-  const chunkCount = meta.chunkCount;
-
-  ctx.set('Content-Type', meta.contentType || 'application/octet-stream');
-  ctx.set('Content-Disposition', `attachment; filename="${meta.fileName}"`);
-  ctx.set('Content-Length', String(meta.fileSize));
-  ctx.set('X-Cursor-Version', meta.version || 'unknown');
-  ctx.set('X-Cursor-Commit', meta.commit || 'unknown');
-  ctx.set('X-Cursor-Cached-At', meta.cachedAt || '');
-  ctx.set('X-Cursor-Chunks', String(chunkCount));
-  ctx.set('X-Cursor-Source-Url', meta.sourceUrl || '');
-
-  // Reassemble chunks back into a single streamed response.
-  async function* reassemble() {
-    for (let i = 0; i < chunkCount; i++) {
-      const buf = await store.get(`chunks/${platform}/${i}`, { type: 'arrayBuffer' });
-      if (!buf) {
-        throw new Error(`chunk_missing: index=${i} total=${chunkCount}; run POST /api/update?platform=${platform}&force=true to repair`);
-      }
-      yield Buffer.from(buf);
-    }
-  }
-
-  ctx.body = Readable.from(reassemble());
-});
+}
 
 // ---------- Auto-update (for GitHub Actions cron) ----------
 
@@ -620,9 +665,6 @@ router.get('/api/download', async (ctx) => {
 //   2. If an update is needed, starts/resumes the chunked download.
 //   3. Downloads as many chunks as possible within a 25s time budget.
 //   4. Returns the current state so the caller knows whether to call again.
-//
-// The caller loops until response.action is 'skipped' or 'completed'.
-// This avoids the 30s function cap: each call does a bounded amount of work.
 router.post('/api/auto-update', async (ctx) => {
   const platform = ctx.query.platform || 'win32-x64-user';
   if (!isValidPlatform(platform)) {
@@ -632,23 +674,18 @@ router.post('/api/auto-update', async (ctx) => {
   }
 
   const startedAt = Date.now();
-  // 25s budget — leaves ~5s buffer under EdgeOne's 30s function cap.
   const TIME_BUDGET_MS = 25000;
 
   // ---- Phase 1: Check if we need to update ----
-  // Only do the (slow) cursor.com HEAD if there's no download already in
-  // progress. If status='downloading', skip straight to resuming chunks.
   let cached = await getCachedMeta(platform);
   const isInProgress = cached && cached.status === 'downloading'
     && cached.commit && cached.sourceUrl
     && cached.chunkSize === CHUNK_SIZE;
 
   let latest = null;
-  let needsUpdate = true;
   let checkSkipped = false;
 
   if (isInProgress) {
-    // Resume — don't re-check cursor.com, just keep downloading chunks.
     checkSkipped = true;
   } else {
     try {
@@ -667,7 +704,6 @@ router.post('/api/auto-update', async (ctx) => {
     const ready = cached && cached.status === 'ready';
     const sameCommit = ready && latest.commit && cached.commit === latest.commit;
     if (sameCommit) {
-      // Already up to date.
       ctx.body = {
         action: 'skipped',
         reason: 'already_latest',
@@ -684,7 +720,6 @@ router.post('/api/auto-update', async (ctx) => {
       };
       return;
     }
-    // Need to start a fresh download.
     let totalSize, chunkCount;
     try {
       ({ totalSize, chunkCount } = await probeRangeSupport(latest.url));
@@ -725,31 +760,20 @@ router.post('/api/auto-update', async (ctx) => {
   let lastError = null;
 
   for (let i = 0; i < cached.chunkCount; i++) {
-    // Time budget check — stop if we're running low.
-    if (Date.now() - startedAt > TIME_BUDGET_MS) {
-      break;
-    }
+    if (Date.now() - startedAt > TIME_BUDGET_MS) break;
     if (chunksDoneSet.has(i)) continue;
 
     try {
-      const range = await downloadSingleChunk(
-        platform, cached.sourceUrl, i, cached.fileSize, cached.chunkSize
-      );
+      await downloadSingleChunk(platform, cached.sourceUrl, i, cached.fileSize, cached.chunkSize);
       cached.chunksDone.push(i);
       chunksDoneSet.add(i);
       chunksDownloadedThisCall++;
       consecutiveFailures = 0;
-      // Persist progress after each chunk so a crash doesn't lose work.
       await saveCachedMeta(platform, cached);
     } catch (e) {
       lastError = e;
       consecutiveFailures++;
-      // If we fail 5 times in a row, abort this call — the scheduler will
-      // retry. Persisting what we have so far.
-      if (consecutiveFailures >= 5) {
-        break;
-      }
-      // Brief pause before retrying the next chunk.
+      if (consecutiveFailures >= 5) break;
       await sleep(1000);
     }
   }
@@ -762,21 +786,13 @@ router.post('/api/auto-update', async (ctx) => {
     await saveCachedMeta(platform, cached);
   }
 
-  // Refresh latest info if we skipped the check (for the response).
-  if (!latest) {
-    latest = metaToLatest(cached);
-  }
-
+  if (!latest) latest = metaToLatest(cached);
   const bytesDownloaded = sumBytesDone(cached);
   const durationMs = Date.now() - startedAt;
 
   ctx.body = {
     action: allDone ? 'completed' : 'in_progress',
-    reason: allDone
-      ? 'all_chunks_downloaded'
-      : checkSkipped
-        ? 'resumed_download'
-        : 'started_download',
+    reason: allDone ? 'all_chunks_downloaded' : checkSkipped ? 'resumed_download' : 'started_download',
     latest,
     cached,
     progress: {
@@ -790,9 +806,239 @@ router.post('/api/auto-update', async (ctx) => {
     consecutiveFailures,
     lastError: lastError ? describeFetchError(lastError) : null,
     durationMs,
-    // Tell the caller whether to loop again.
     callAgain: !allDone,
   };
+});
+
+// ---------- Download endpoints ----------
+
+router.get('/api/download-chunk', async (ctx) => {
+  const platform = ctx.query.platform;
+  const index = parseInt(ctx.query.index, 10);
+  if (!isValidPlatform(platform) || Number.isNaN(index)) {
+    ctx.status = 400;
+    ctx.body = { error: 'invalid_params', detail: 'Need platform and index.' };
+    return;
+  }
+  const meta = await getCachedMeta(platform);
+  if (!meta || meta.status !== 'ready') {
+    ctx.status = 404;
+    ctx.body = { error: 'not_ready', detail: 'No cached installer. Run /api/update first.' };
+    return;
+  }
+  if (index < 0 || index >= meta.chunkCount) {
+    ctx.status = 400;
+    ctx.body = { error: 'invalid_index', detail: `index must be 0..${meta.chunkCount - 1}` };
+    return;
+  }
+  const store = getStoreInstance();
+  const buf = await store.get(`chunks/${platform}/${index}`, { type: 'arrayBuffer' });
+  if (!buf) {
+    ctx.status = 404;
+    ctx.body = { error: 'chunk_missing', detail: `Chunk ${index} not found in blob storage.` };
+    return;
+  }
+  ctx.set('Content-Type', 'application/octet-stream');
+  ctx.set('Content-Length', String(buf.byteLength));
+  ctx.body = Buffer.from(buf);
+});
+
+router.get('/api/download-manifest', async (ctx) => {
+  const platform = ctx.query.platform;
+  if (!isValidPlatform(platform)) {
+    ctx.status = 400;
+    ctx.body = { error: 'invalid_platform' };
+    return;
+  }
+  const meta = await getCachedMeta(platform);
+  if (!meta || meta.status !== 'ready') {
+    ctx.status = 404;
+    ctx.body = { error: 'not_ready', detail: 'No cached installer.' };
+    return;
+  }
+  const chunks = [];
+  for (let i = 0; i < meta.chunkCount; i++) {
+    const start = i * meta.chunkSize;
+    const end = Math.min(start + meta.chunkSize - 1, meta.fileSize - 1);
+    chunks.push({
+      index: i,
+      url: `/koa/api/download-chunk?platform=${platform}&index=${i}`,
+      size: end - start + 1,
+    });
+  }
+  ctx.body = {
+    platform,
+    version: meta.version,
+    commit: meta.commit,
+    fileName: meta.fileName,
+    fileSize: meta.fileSize,
+    chunkCount: meta.chunkCount,
+    chunkSize: meta.chunkSize,
+    chunks,
+  };
+});
+
+router.get('/api/download', async (ctx) => {
+  const platform = ctx.query.platform;
+  if (!isValidPlatform(platform)) {
+    ctx.status = 400;
+    ctx.body = { error: 'invalid_platform' };
+    return;
+  }
+  const meta = await getCachedMeta(platform);
+  if (!meta || meta.status !== 'ready') {
+    ctx.status = 404;
+    ctx.body = { error: 'not_ready' };
+    return;
+  }
+  ctx.set('Content-Type', meta.contentType || 'application/octet-stream');
+  ctx.set('Content-Disposition', `attachment; filename="${meta.fileName}"`);
+  ctx.set('Content-Length', String(meta.fileSize));
+
+  async function* reassemble() {
+    const store = getStoreInstance();
+    for (let i = 0; i < meta.chunkCount; i++) {
+      const buf = await store.get(`chunks/${platform}/${i}`, { type: 'arrayBuffer' });
+      if (!buf) {
+        throw new Error(`chunk_missing: index=${i} total=${meta.chunkCount}; run POST /api/update?platform=${platform}&force=true to repair`);
+      }
+      yield Buffer.from(buf);
+    }
+  }
+
+  ctx.body = Readable.from(reassemble());
+});
+
+// ---------- Changelog ----------
+
+// Fetch the changelog page from cursor.com, extract readable text, and cache
+// it in blob storage. Restricted environments can't reach cursor.com, so we
+// mirror the content just like the installer.
+async function fetchAndCacheChangelog() {
+  const resp = await fetchWithRetry('https://www.cursor.com/changelog', {
+    method: 'GET',
+    headers: { ...FETCH_HEADERS, Accept: 'text/html,application/xhtml+xml' },
+    redirect: 'follow',
+  }, { tries: 3, timeoutMs: 10000 });
+  if (!resp.ok) {
+    throw new Error(`cursor.com changelog fetch failed: HTTP ${resp.status}`);
+  }
+  const html = await resp.text();
+
+  // Extract only the main content area to avoid caching navigation, headers,
+  // footers, and other boilerplate.
+  let content = html;
+  content = content.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+  content = content.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+  content = content.replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
+  content = content.replace(/<svg[^>]*>[\s\S]*?<\/svg>/gi, '');
+  content = content.replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '');
+  content = content.replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '');
+  content = content.replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '');
+  content = content.replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, '');
+  content = content.replace(/<link[^>]*>/gi, '');
+  content = content.replace(/<meta[^>]*>/gi, '');
+  content = content.replace(/<!--[\s\S]*?-->/g, '');
+
+  // Try to isolate <main> or <article>.
+  let mainContent = '';
+  const mainMatch = content.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+  if (mainMatch) {
+    mainContent = mainMatch[1];
+  } else {
+    const articleMatch = content.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
+    if (articleMatch) mainContent = articleMatch[1];
+  }
+  let text = mainContent || content;
+
+  // Convert to readable text.
+  text = text.replace(/<\/(p|div|section|article|h[1-6]|li|ul|ol|tr|table|tbody|thead|br)>/gi, '\n');
+  text = text.replace(/<br\s*\/?>/gi, '\n');
+  text = text.replace(/<li[^>]*>/gi, '\n• ');
+  text = text.replace(/<[^>]+>/g, '');
+  text = text.replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&mdash;/g, '—')
+    .replace(/&ndash;/g, '–')
+    .replace(/&hellip;/g, '…')
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));
+  text = text.replace(/[ \t]+/g, ' ');
+  text = text.replace(/\n[ \t]+/g, '\n');
+  text = text.replace(/\n{3,}/g, '\n\n');
+  text = text.trim();
+
+  if (text.length < 200) {
+    text = content
+      .replace(/<\/(p|div|section|article|h[1-6]|li|ul|ol|tr|table|tbody|thead|br)>/gi, '\n')
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<li[^>]*>/gi, '\n• ')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'")
+      .replace(/&nbsp;/g, ' ').replace(/&mdash;/g, '—').replace(/&ndash;/g, '–')
+      .replace(/&hellip;/g, '…')
+      .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+      .replace(/[ \t]+/g, ' ')
+      .replace(/\n[ \t]+/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  const changelogData = {
+    text,
+    sourceUrl: 'https://www.cursor.com/changelog',
+    fetchedAt: new Date().toISOString(),
+  };
+
+  const store = getStoreInstance();
+  await store.setJSON('changelog/cached', changelogData);
+  return changelogData;
+}
+
+router.get('/api/changelog', async (ctx) => {
+  const force = ctx.query.force === 'true' || ctx.query.force === '1';
+  const store = getStoreInstance();
+  const startedAt = Date.now();
+
+  let changelog = null;
+  if (!force) {
+    try {
+      changelog = await store.get('changelog/cached', { type: 'json' });
+    } catch (_) {}
+  }
+
+  if (!changelog) {
+    try {
+      changelog = await fetchAndCacheChangelog();
+    } catch (e) {
+      if (!force) {
+        try {
+          changelog = await store.get('changelog/cached', { type: 'json' });
+        } catch (_) {}
+      }
+      if (changelog) {
+        ctx.body = {
+          changelog,
+          warning: `Failed to refresh from cursor.com: ${describeFetchError(e)}. Showing cached version from ${changelog.fetchedAt}.`,
+          durationMs: Date.now() - startedAt,
+        };
+        return;
+      }
+      ctx.status = 502;
+      ctx.body = { error: 'fetch_changelog_failed', detail: describeFetchError(e), durationMs: Date.now() - startedAt };
+      return;
+    }
+  }
+
+  ctx.set('Cache-Control', 'no-store');
+  ctx.body = { changelog, durationMs: Date.now() - startedAt };
 });
 
 app.use(router.routes());
