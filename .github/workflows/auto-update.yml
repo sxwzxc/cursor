@@ -1,5 +1,5 @@
 # 每天 0:00 (北京时间 = UTC 16:00) 自动检查并缓存 Cursor Windows 最新版，
-# 同时刷新更新日志与模型价目表的镜像缓存（内容变更时自动触发 LLM 翻译）。
+# 同时刷新更新日志（变更时触发 LLM 翻译）与订阅套餐价目表的镜像缓存。
 # GitHub Actions cron 使用 UTC，所以 cron 表达式为 "0 16 * * *"。
 # 注意：GitHub Actions cron 不保证准时，可能有最多 30 分钟的延迟。
 name: Daily Auto-Update Cursor
@@ -68,11 +68,11 @@ jobs:
           echo "=== Reached max calls ($MAX_CALLS), stopping ==="
           echo "The download may still be in progress; next scheduled run will continue."
 
-      - name: Refresh changelog & models mirror
+      - name: Refresh changelog & pricing mirror
         # Force-refresh the docs mirror caches so they stay current without
-        # relying on a user clicking the buttons. Each endpoint fetches
-        # cursor.com, diffs by hash, and only calls the LLM when content
-        # actually changed (so most days this is a cheap no-op).
+        # relying on a user clicking the buttons. changelog diffs by hash
+        # and only calls the LLM when content changed; pricing just re-fetches
+        # the SSR text (no translation per the plan).
         run: |
           set -euo pipefail
           for path in changelog models; do

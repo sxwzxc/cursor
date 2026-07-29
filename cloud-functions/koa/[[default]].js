@@ -557,7 +557,7 @@ router.get('/', (ctx) => {
       'GET /api/download?platform=<id>': 'Legacy single-shot stream — will 413 for large files; prefer the manifest flow',
       'GET /api/changelog?force=<bool>': 'Fetch and cache the cursor.com changelog page as text',
       'GET /api/changelog?lang=zh': 'Get the Simplified-Chinese LLM translation of the cached changelog (auto-generated when source changes)',
-      'GET /api/models?force=<bool>&lang=zh|orig': 'Mirror cursor.com/docs/models-and-pricing (model list + pricing tables); ?lang=zh returns the LLM translation',
+      'GET /api/models?force=<bool>': 'Mirror cursor.com/en/pricing (subscription plan pricing) as text; shown in English as-is',
     },
   };
 });
@@ -1467,14 +1467,15 @@ function htmlToReadableText(html) {
   return text;
 }
 
-const MODELS_SOURCE_URL = 'https://cursor.com/docs/models-and-pricing';
+const MODELS_SOURCE_URL = 'https://www.cursor.com/en/pricing';
 const MODELS_SOURCE_BLOB = 'models/cached';
-const MODELS_ZH_BLOB = 'models/cached_zh';
 
-// Fetch the cursor.com Models & Pricing docs page, extract readable text,
-// and cache it in blob storage. Mirrors fetchAndCacheChangelog: detects
-// content changes via hash, auto-triggers an LLM translation to Simplified
-// Chinese when the source changes, and caches the translation by hash.
+// Fetch the cursor.com/en/pricing page, extract readable text, and cache it
+// in blob storage. Per the user's request, the pricing/plan content is shown
+// in English (原文) without LLM translation — prices and plan names are
+// universal and translate poorly — so unlike changelog this does NOT call
+// the LLM. We still hash the text so the cron refresh can detect changes
+// and avoid needless re-writes.
 async function fetchAndCacheModels() {
   const resp = await fetchWithRetry(MODELS_SOURCE_URL, {
     method: 'GET',
@@ -1482,12 +1483,12 @@ async function fetchAndCacheModels() {
     redirect: 'follow',
   }, { tries: 3, timeoutMs: 10000 });
   if (!resp.ok) {
-    throw new Error(`cursor.com models fetch failed: HTTP ${resp.status}`);
+    throw new Error(`cursor.com pricing fetch failed: HTTP ${resp.status}`);
   }
   const html = await resp.text();
   const text = htmlToReadableText(html);
   if (text.length < 200) {
-    throw new Error(`cursor.com models parse produced too-short text (${text.length} chars)`);
+    throw new Error(`cursor.com pricing parse produced too-short text (${text.length} chars)`);
   }
 
   const newHash = hashText(text);
@@ -1507,100 +1508,24 @@ async function fetchAndCacheModels() {
   };
 
   if (sameContent && previous) {
+    // Content unchanged — keep the original fetch time.
     modelsData.fetchedAt = previous.fetchedAt;
-    modelsData.translationStatus = previous.translationStatus || (llmConfigured() ? 'pending' : 'none');
-    modelsData.translatedAt = previous.translatedAt || null;
     await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
     return modelsData;
   }
 
-  if (!llmConfigured()) {
-    modelsData.translationStatus = 'none';
-    modelsData.translatedAt = null;
-    await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
-    return modelsData;
-  }
-
-  const existingZh = await getCachedTranslation(newHash, MODELS_ZH_BLOB);
-  if (existingZh) {
-    modelsData.translationStatus = 'done';
-    modelsData.translatedAt = existingZh.translatedAt;
-    await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
-    return modelsData;
-  }
-
-  modelsData.translationStatus = 'pending';
-  modelsData.translatedAt = null;
-  await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
-
-  const zh = await buildAndStoreTranslation(modelsData, MODELS_ZH_BLOB, 'models');
-  if (zh) {
-    modelsData.translationStatus = 'done';
-    modelsData.translatedAt = zh.translatedAt;
-  } else {
-    modelsData.translationStatus = 'failed';
-  }
   await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
   return modelsData;
 }
 
-// GET /api/models?force=<bool>&lang=zh|orig
-// Mirrors /api/changelog: mirrors cursor.com/docs/models-and-pricing, caches
-// the extracted text, and (when lang=zh) returns the LLM-translated Chinese
-// version. The cron job calls ?force=true daily so the cache stays fresh.
+// GET /api/models?force=<bool>
+// Mirrors cursor.com/en/pricing (subscription plan pricing). The content is
+// shown in English as-is (no translation). The cron job calls ?force=true
+// daily so the cache stays fresh.
 router.get('/api/models', async (ctx) => {
   const force = ctx.query.force === 'true' || ctx.query.force === '1';
-  const lang = ctx.query.lang === 'zh' ? 'zh' : 'orig';
   const store = getStoreInstance();
   const startedAt = Date.now();
-
-  if (lang === 'zh') {
-    let source = null;
-    try {
-      source = await store.get(MODELS_SOURCE_BLOB, { type: 'json' });
-    } catch (_) {}
-
-    // Migration: backfill hash for blobs written before hashing existed.
-    if (source && source.text && !source.hash) {
-      source.hash = hashText(source.text);
-      try { await store.setJSON(MODELS_SOURCE_BLOB, source); } catch (_) {}
-    }
-
-    if (source && source.hash) {
-      let zh = await getCachedTranslation(source.hash, MODELS_ZH_BLOB);
-      if (!zh && llmConfigured() && source.translationStatus !== 'pending') {
-        zh = await buildAndStoreTranslation(source, MODELS_ZH_BLOB, 'models');
-        if (zh) {
-          source.translationStatus = 'done';
-          source.translatedAt = zh.translatedAt;
-          try { await store.setJSON(MODELS_SOURCE_BLOB, source); } catch (_) {}
-        }
-      }
-      if (zh) {
-        ctx.set('Cache-Control', 'no-store');
-        ctx.body = { models: zh, durationMs: Date.now() - startedAt };
-        return;
-      }
-      ctx.status = 404;
-      ctx.body = {
-        error: 'translation_unavailable',
-        translationStatus: source.translationStatus || (llmConfigured() ? 'pending' : 'none'),
-        detail: llmConfigured()
-          ? 'Translation is not ready yet. Try the original text and switch back in a few seconds.'
-          : 'EdgeOne Makers AI Gateway key is not configured (AI_GATEWAY_API_KEY).',
-        durationMs: Date.now() - startedAt,
-      };
-      return;
-    }
-
-    ctx.status = 404;
-    ctx.body = {
-      error: 'no_models',
-      detail: 'Models page has not been fetched yet. Open the models view once to populate the cache, then switch to 简体中文.',
-      durationMs: Date.now() - startedAt,
-    };
-    return;
-  }
 
   let models = null;
   if (!force) {
