@@ -557,7 +557,7 @@ router.get('/', (ctx) => {
       'GET /api/download?platform=<id>': 'Legacy single-shot stream — will 413 for large files; prefer the manifest flow',
       'GET /api/changelog?force=<bool>': 'Fetch and cache the cursor.com changelog page as text',
       'GET /api/changelog?lang=zh': 'Get the Simplified-Chinese LLM translation of the cached changelog (auto-generated when source changes)',
-      'GET /api/models?force=<bool>': 'Mirror cursor.com/en/pricing (subscription plan pricing) as text; shown in English as-is',
+      'GET /api/models?force=<bool>': 'Mirror cursor.com/docs/models-and-pricing per-model token pricing table; shown in English as-is',
     },
   };
 });
@@ -1467,33 +1467,157 @@ function htmlToReadableText(html) {
   return text;
 }
 
-const MODELS_SOURCE_URL = 'https://www.cursor.com/en/pricing';
+const MODELS_SOURCE_URL = 'https://cursor.com/docs/models-and-pricing';
 const MODELS_SOURCE_BLOB = 'models/cached';
 
-// Fetch the cursor.com/en/pricing page, extract readable text, and cache it
-// in blob storage. Per the user's request, the pricing/plan content is shown
-// in English (原文) without LLM translation — prices and plan names are
-// universal and translate poorly — so unlike changelog this does NOT call
-// the LLM. We still hash the text so the cron refresh can detect changes
-// and avoid needless re-writes.
+// Parse a cursor.com docs JS chunk and extract the model pricing table.
+// The chunk embeds an array of model objects as a JS object literal, e.g.:
+//   {name:"Claude 4.6 Sonnet",provider:"Anthropic",tokenInput:3,
+//    cacheWrite:3.75,cacheRead:.3,tokenOutput:15,contextWindow:"200k",
+//    maxContextWindow:"1M",isAgent:!0,thinking:!0,hidden:!0,...}
+// We anchor on `name:"..."` (robust to nested object boundaries) and pull
+// each field from the segment between consecutive names. Variant records
+// named "Thinking"/"Fast Mode"/"Long Context (>200k)" inherit the preceding
+// main model name so rows are self-describing.
+function parseModelsFromChunk(js) {
+  const nameRe = /name:"((?:[^"\\]|\\.)*)"/g;
+  const names = [];
+  let m;
+  while ((m = nameRe.exec(js)) !== null) names.push(m);
+  if (names.length === 0) return [];
+
+  const fld = (seg, key) => {
+    const r = new RegExp(key + ':(!0|!1|true|false|"[^"]*"|\\d+\\.?\\d*|\\[[^\\]]*\\])');
+    const mm = seg.match(r);
+    if (!mm) return null;
+    const v = mm[1];
+    if (v === '!0' || v === 'true') return true;
+    if (v === '!1' || v === 'false') return false;
+    if (v.startsWith('"')) return v.slice(1, -1);
+    if (v.startsWith('[')) return v;
+    const n = parseFloat(v);
+    return Number.isFinite(n) ? n : v;
+  };
+
+  const VARIANT_NAMES = new Set(['Thinking', 'Fast Mode', 'Long Context (>200k)']);
+  const rows = [];
+  let lastName = '';
+  for (let i = 0; i < names.length; i++) {
+    const rawName = names[i][1].replace(/\\"/g, '"');
+    const segStart = names[i].index + names[i][0].length;
+    const segEnd = i + 1 < names.length ? names[i + 1].index : js.length;
+    let seg = js.slice(segStart, segEnd);
+    if (seg.indexOf('tokenInput') === -1 && i > 0) {
+      // fields may precede the name; look back to previous name
+      seg = js.slice(names[i - 1].index + names[i - 1][0].length, segEnd);
+    }
+    if (seg.indexOf('tokenInput') === -1) continue;
+    const ti = fld(seg, 'tokenInput');
+    if (ti == null) continue;
+
+    let displayName = rawName;
+    if (VARIANT_NAMES.has(rawName)) {
+      displayName = lastName ? `${lastName} — ${rawName}` : rawName;
+    } else {
+      lastName = rawName;
+    }
+    rows.push({
+      name: displayName,
+      provider: fld(seg, 'provider'),
+      tokenInput: ti,
+      cacheWrite: fld(seg, 'cacheWrite'),
+      cacheRead: fld(seg, 'cacheRead'),
+      tokenOutput: fld(seg, 'tokenOutput'),
+      contextWindow: fld(seg, 'contextWindow'),
+      maxContextWindow: fld(seg, 'maxContextWindow'),
+      isAgent: fld(seg, 'isAgent'),
+      thinking: fld(seg, 'thinking'),
+      hidden: fld(seg, 'hidden'),
+    });
+  }
+  return rows;
+}
+
+// Render the parsed model array as a Markdown table (per-million-token USD).
+function renderModelsMarkdown(rows) {
+  const fmt = (v) => {
+    if (v === null || v === undefined || v === '') return '—';
+    if (v === true) return '✓';
+    if (v === false) return '';
+    if (typeof v === 'number') return '$' + v;
+    return String(v);
+  };
+  const header = '| Model | Provider | Input | Cache Write | Cache Read | Output | Context | Max |';
+  const sep = '|---|---|---|---|---|---|---|---|';
+  const lines = rows.map((r) =>
+    `| ${r.name} | ${r.provider || ''} | ${fmt(r.tokenInput)} | ${fmt(r.cacheWrite)} | ${fmt(r.cacheRead)} | ${fmt(r.tokenOutput)} | ${r.contextWindow || '—'} | ${r.maxContextWindow || '—'} |`
+  );
+  return [header, sep, ...lines].join('\n');
+}
+
+// Fetch the cursor.com/docs/models-and-pricing HTML, discover the JS chunk
+// that embeds the per-model token-pricing table, parse it, and cache both
+// the structured rows and a Markdown rendering. The chunk filename is a
+// hash that changes on every cursor.com deploy, so we discover it at runtime
+// by fetching all referenced chunks in parallel and picking the one whose
+// body contains `tokenInput:`. This runs once per cron refresh (daily) and
+// on first user visit; subsequent reads are cache hits.
 async function fetchAndCacheModels() {
   const resp = await fetchWithRetry(MODELS_SOURCE_URL, {
     method: 'GET',
     headers: { ...FETCH_HEADERS, Accept: 'text/html,application/xhtml+xml' },
     redirect: 'follow',
-  }, { tries: 3, timeoutMs: 10000 });
+  }, { tries: 3, timeoutMs: 12000 });
   if (!resp.ok) {
-    throw new Error(`cursor.com pricing fetch failed: HTTP ${resp.status}`);
+    throw new Error(`cursor.com docs fetch failed: HTTP ${resp.status}`);
   }
   const html = await resp.text();
-  const text = htmlToReadableText(html);
-  if (text.length < 200) {
-    throw new Error(`cursor.com pricing parse produced too-short text (${text.length} chars)`);
+
+  // Extract every <script src="..."> chunk URL.
+  const srcs = [];
+  const srcRe = /<script[^>]*\ssrc=["']([^"']+)["']/gi;
+  let mm;
+  while ((mm = srcRe.exec(html)) !== null) srcs.push(mm[1]);
+  const base = MODELS_SOURCE_URL.replace(/\/[^/]*$/, '');
+  const absUrls = srcs
+    .map((s) => (s.startsWith('http') ? s : s.startsWith('//') ? 'https:' + s : base + s))
+    // only the docs-static chunk pool
+    .filter((s) => /\/_next\/static\/chunks\//.test(s));
+  if (absUrls.length === 0) {
+    throw new Error('no JS chunks referenced by cursor.com docs page');
   }
 
-  const newHash = hashText(text);
-  const store = getStoreInstance();
+  // Fetch chunks in parallel (bounded) and pick the one with the pricing data.
+  const CONCURRENCY = 12;
+  let dataChunk = null;
+  for (let i = 0; i < absUrls.length && !dataChunk; i += CONCURRENCY) {
+    const batch = absUrls.slice(i, i + CONCURRENCY);
+    const results = await Promise.allSettled(batch.map(async (u) => {
+      const r = await fetchWithRetry(u, {
+        method: 'GET',
+        headers: { ...FETCH_HEADERS, Accept: '*/*' },
+        redirect: 'follow',
+      }, { tries: 1, timeoutMs: 9000 });
+      if (!r.ok) return null;
+      const body = await r.text();
+      return body.indexOf('tokenInput:') !== -1 ? body : null;
+    }));
+    for (const res of results) {
+      if (res.status === 'fulfilled' && res.value) { dataChunk = res.value; break; }
+    }
+  }
+  if (!dataChunk) {
+    throw new Error('pricing data chunk not found among ' + absUrls.length + ' chunks');
+  }
 
+  const rows = parseModelsFromChunk(dataChunk);
+  if (rows.length === 0) {
+    throw new Error('parsed 0 models from pricing chunk');
+  }
+  const text = renderModelsMarkdown(rows);
+  const newHash = hashText(text);
+
+  const store = getStoreInstance();
   let previous = null;
   try {
     previous = await store.get(MODELS_SOURCE_BLOB, { type: 'json' });
@@ -1502,26 +1626,23 @@ async function fetchAndCacheModels() {
 
   const modelsData = {
     text,
+    models: rows,
     sourceUrl: MODELS_SOURCE_URL,
     fetchedAt: new Date().toISOString(),
     hash: newHash,
   };
-
   if (sameContent && previous) {
-    // Content unchanged — keep the original fetch time.
     modelsData.fetchedAt = previous.fetchedAt;
-    await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
-    return modelsData;
   }
-
   await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
   return modelsData;
 }
 
 // GET /api/models?force=<bool>
-// Mirrors cursor.com/en/pricing (subscription plan pricing). The content is
-// shown in English as-is (no translation). The cron job calls ?force=true
-// daily so the cache stays fresh.
+// Mirrors the cursor.com/docs/models-and-pricing per-model token pricing
+// table (Input / Cache Write / Cache Read / Output per million tokens).
+// Shown in English as-is (no translation — prices are universal). The cron
+// job calls ?force=true daily so the cache stays fresh.
 router.get('/api/models', async (ctx) => {
   const force = ctx.query.force === 'true' || ctx.query.force === '1';
   const store = getStoreInstance();

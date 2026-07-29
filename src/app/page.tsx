@@ -70,6 +70,27 @@ interface ChangelogData {
   translatedAt?: string;
 }
 
+interface ModelRow {
+  name: string;
+  provider?: string | null;
+  tokenInput: number;
+  cacheWrite?: number | null;
+  cacheRead?: number | null;
+  tokenOutput: number;
+  contextWindow?: string | null;
+  maxContextWindow?: string | null;
+  isAgent?: boolean | null;
+  thinking?: boolean | null;
+  hidden?: boolean | null;
+}
+
+interface ModelsData {
+  text: string;
+  models: ModelRow[];
+  sourceUrl: string;
+  fetchedAt: string;
+}
+
 const PLATFORMS = [
   { id: "win32-x64-user", label: "Windows x64", desc: "User Setup · .exe" },
   { id: "darwin-arm64", label: "macOS Apple Silicon", desc: "ARM64 · .dmg" },
@@ -114,7 +135,7 @@ export default function Home() {
   const [changelogLang, setChangelogLang] = useState<"orig" | "zh">("orig");
   const [zhLoading, setZhLoading] = useState(false);
   const [showChangelog, setShowChangelog] = useState(false);
-  const [models, setModels] = useState<ChangelogData | null>(null);
+  const [models, setModels] = useState<ModelsData | null>(null);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [showModels, setShowModels] = useState(false);
   const platformRef = useRef(platform);
@@ -436,7 +457,7 @@ export default function Home() {
               className="flex cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs text-gray-400 transition-colors hover:bg-white/5 hover:text-white"
             >
               <Layers className="h-3.5 w-3.5" />
-              价目表
+              模型单价
             </button>
             <button
               onClick={handleChangelog}
@@ -734,7 +755,7 @@ GET  /koa/api/download-manifest?platform=  分片清单
 GET  /koa/api/download-chunk?platform=&index=  下载单个分片
 GET  /koa/api/changelog?force=<bool>   获取并缓存更新日志
 GET  /koa/api/changelog?lang=zh        获取简体中文翻译
-GET  /koa/api/models?force=<bool>      获取并缓存订阅套餐价目表（原文）
+GET  /koa/api/models?force=<bool>      获取并缓存模型 Token 单价表（原文）
 GET  /koa/api/debug-llm               (调试) 检查 LLM 环境变量配置
 GET  /koa/api/debug-translate          (调试) 测试一次 LLM 翻译调用`}
             </pre>
@@ -865,10 +886,10 @@ GET  /koa/api/debug-translate          (调试) 测试一次 LLM 翻译调用`}
             <div className="flex items-center justify-between border-b border-white/5 px-6 py-4">
               <h3 className="flex items-center gap-2 text-base font-semibold">
                 <Layers className="h-4 w-4 text-[#1c66e5]" />
-                订阅套餐价目表
+                模型 Token 单价表
                 {models && (
                   <span className="ml-2 text-[10px] font-normal text-gray-500">
-                    更新于 {new Date(models.fetchedAt).toLocaleString("zh-CN")}
+                    更新于 {new Date(models.fetchedAt).toLocaleString("zh-CN")} · 共 {models.models.length} 个
                   </span>
                 )}
               </h3>
@@ -891,14 +912,69 @@ GET  /koa/api/debug-translate          (调试) 测试一次 LLM 翻译调用`}
                 </button>
               </div>
             </div>
-            <div className="flex-1 overflow-y-auto px-6 py-4">
+            <div className="flex-1 overflow-auto px-6 py-4">
               {modelsLoading ? (
                 <div className="flex items-center justify-center py-12">
                   <Loader2 className="h-6 w-6 animate-spin text-gray-400" />
-                  <span className="ml-3 text-sm text-gray-400">加载中…</span>
+                  <span className="ml-3 text-sm text-gray-400">加载中…（首次需抓取官方页面，约 10-15 秒）</span>
                 </div>
-              ) : models ? (
-                <pre className="whitespace-pre-wrap break-words font-mono text-xs leading-relaxed text-gray-300">{models.text}</pre>
+              ) : models && models.models.length > 0 ? (
+                <>
+                  <p className="mb-3 text-[11px] text-gray-500">
+                    单位：USD / 百万 tokens（$/M tokens），数据镜像自 cursor.com/docs/models-and-pricing
+                  </p>
+                  <table className="w-full border-collapse text-left text-xs">
+                    <thead className="sticky top-0 z-10 bg-[#0a0d14]">
+                      <tr className="border-b border-white/10 text-gray-400">
+                        <th className="px-2 py-2 font-medium">模型</th>
+                        <th className="px-2 py-2 font-medium">提供商</th>
+                        <th className="px-2 py-2 text-right font-medium">输入</th>
+                        <th className="px-2 py-2 text-right font-medium">缓存写</th>
+                        <th className="px-2 py-2 text-right font-medium">缓存读</th>
+                        <th className="px-2 py-2 text-right font-medium">输出</th>
+                        <th className="px-2 py-2 text-right font-medium">上下文</th>
+                        <th className="px-2 py-2 text-right font-medium">最大</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {models.models.map((r, i) => {
+                        const isVariant = r.name.includes(" — ");
+                        const isHidden = r.hidden === true;
+                        return (
+                          <tr
+                            key={i}
+                            className={`border-b border-white/[0.03] transition-colors hover:bg-white/[0.03] ${
+                              isVariant ? "opacity-60" : ""
+                            }`}
+                          >
+                            <td className="px-2 py-1.5 text-gray-200">
+                              <span className="flex items-center gap-1.5">
+                                {r.thinking && !isVariant && (
+                                  <span title="支持思考模式" className="text-[#1c66e5]">◈</span>
+                                )}
+                                {r.name}
+                                {isHidden && (
+                                  <span className="rounded bg-white/5 px-1 text-[9px] text-gray-500">隐藏</span>
+                                )}
+                              </span>
+                            </td>
+                            <td className="px-2 py-1.5 text-gray-400">{r.provider || "—"}</td>
+                            <td className="px-2 py-1.5 text-right font-mono text-gray-300">${r.tokenInput}</td>
+                            <td className="px-2 py-1.5 text-right font-mono text-gray-400">
+                              {r.cacheWrite != null ? `$${r.cacheWrite}` : "—"}
+                            </td>
+                            <td className="px-2 py-1.5 text-right font-mono text-gray-400">
+                              {r.cacheRead != null ? `$${r.cacheRead}` : "—"}
+                            </td>
+                            <td className="px-2 py-1.5 text-right font-mono text-gray-300">${r.tokenOutput}</td>
+                            <td className="px-2 py-1.5 text-right font-mono text-gray-500">{r.contextWindow || "—"}</td>
+                            <td className="px-2 py-1.5 text-right font-mono text-gray-500">{r.maxContextWindow || "—"}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </>
               ) : (
                 <p className="py-12 text-center text-sm text-gray-500">无内容</p>
               )}

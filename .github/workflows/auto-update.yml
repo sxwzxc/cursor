@@ -1,5 +1,5 @@
 # 每天 0:00 (北京时间 = UTC 16:00) 自动检查并缓存 Cursor Windows 最新版，
-# 同时刷新更新日志（变更时触发 LLM 翻译）与订阅套餐价目表的镜像缓存。
+# 同时刷新更新日志（变更时触发 LLM 翻译）与模型 Token 单价表的镜像缓存。
 # GitHub Actions cron 使用 UTC，所以 cron 表达式为 "0 16 * * *"。
 # 注意：GitHub Actions cron 不保证准时，可能有最多 30 分钟的延迟。
 name: Daily Auto-Update Cursor
