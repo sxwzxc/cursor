@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Download, RefreshCw, CheckCircle2, AlertCircle, Loader2, FileDown, Zap } from "lucide-react";
+import { Download, RefreshCw, CheckCircle2, AlertCircle, Loader2, FileDown, Zap, X, BookOpen } from "lucide-react";
 
 interface LatestInfo {
   platform: string;
@@ -87,6 +87,9 @@ export default function Home() {
   const [downloadProgress, setDownloadProgress] = useState<DownloadProgressInfo | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [autoChecked, setAutoChecked] = useState(false);
+  const [changelog, setChangelog] = useState<{ text: string; fetchedAt: string; sourceUrl: string } | null>(null);
+  const [changelogLoading, setChangelogLoading] = useState(false);
+  const [showChangelog, setShowChangelog] = useState(false);
   const platformRef = useRef(platform);
   platformRef.current = platform;
 
@@ -236,6 +239,22 @@ export default function Home() {
     }
   };
 
+  const handleChangelog = async () => {
+    setShowChangelog(true);
+    if (changelog) return;
+    setChangelogLoading(true);
+    try {
+      const resp = await fetch("/koa/api/changelog");
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || data.error || "获取更新日志失败");
+      setChangelog(data.changelog);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "获取更新日志失败");
+    } finally {
+      setChangelogLoading(false);
+    }
+  };
+
   const onPlatformChange = (id: string) => {
     setPlatform(id);
     setCheckResult(null);
@@ -271,14 +290,13 @@ export default function Home() {
               <p className="text-xs text-gray-500 leading-tight">cursor.sxwzxc.cn</p>
             </div>
           </div>
-          <a
-            href="https://www.cursor.com/changelog"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="text-sm text-gray-400 hover:text-white transition-colors"
+          <button
+            onClick={handleChangelog}
+            className="text-sm text-gray-400 hover:text-white transition-colors flex items-center gap-1 cursor-pointer"
           >
-            官方更新日志 ↗
-          </a>
+            <BookOpen className="w-4 h-4" />
+            更新日志
+          </button>
         </div>
       </header>
 
@@ -582,6 +600,61 @@ GET  /koa/api/changelog?force=<bool>   获取并缓存更新日志`}
           <p>本站仅做镜像缓存，不修改任何安装包内容 · 每天 0:00 自动同步最新版</p>
         </div>
       </footer>
+
+      {/* Changelog modal */}
+      {showChangelog && (
+        <div
+          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setShowChangelog(false)}
+        >
+          <div
+            className="bg-gray-900 border border-gray-700 rounded-lg max-w-2xl w-full max-h-[80vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-800">
+              <h3 className="text-base font-semibold flex items-center gap-2">
+                <BookOpen className="w-4 h-4 text-[#1c66e5]" />
+                Cursor 更新日志
+                {changelog && (
+                  <span className="text-xs text-gray-500 font-normal ml-2">
+                    更新于 {new Date(changelog.fetchedAt).toLocaleString("zh-CN")}
+                  </span>
+                )}
+              </h3>
+              <div className="flex items-center gap-2">
+                {changelog && (
+                  <a
+                    href={changelog.sourceUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-xs text-gray-400 hover:text-white transition-colors"
+                  >
+                    原文 ↗
+                  </a>
+                )}
+                <button
+                  onClick={() => setShowChangelog(false)}
+                  className="text-gray-400 hover:text-white transition-colors cursor-pointer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+            <div className="overflow-y-auto px-6 py-4 flex-1">
+              {changelogLoading ? (
+                <div className="flex items-center justify-center py-12">
+                  <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
+                  <span className="ml-3 text-gray-400 text-sm">加载中…</span>
+                </div>
+              ) : changelog ? (
+                <pre className="text-xs text-gray-300 whitespace-pre-wrap font-mono leading-relaxed">{changelog.text}</pre>
+              ) : (
+                <p className="text-gray-500 text-sm text-center py-12">无内容</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
