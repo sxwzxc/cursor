@@ -319,6 +319,152 @@ function metaToLatest(meta) {
   };
 }
 
+// ---------- Changelog translation (LLM) ----------
+//
+// The changelog is mirrored from cursor.com in English. To let Chinese users
+// read it without leaving the site, we automatically translate it with an
+// OpenAI-compatible chat-completion LLM whenever the source text changes, and
+// cache the translation next to the original in blob storage.
+//
+// Configuration is via environment variables (all optional). When any of them
+// is missing the translation feature is silently disabled so the rest of the
+// site keeps working:
+//   LLM_API_BASE_URL — e.g. https://api.openai.com/v1, or an EdgeOne AI
+//                      Gateway endpoint. The `/chat/completions` path is
+//                      appended automatically.
+//   LLM_API_KEY      — Bearer token sent in the Authorization header.
+//   LLM_MODEL        — model id, e.g. gpt-4o-mini, hunyuan-pro, qwen-turbo…
+//   LLM_TIMEOUT_MS   — per-request timeout (default 25000, fits EdgeOne's
+//                      ~30s function cap with headroom for the fetch itself).
+function getLLMConfig() {
+  const timeout = parseInt(process.env.LLM_TIMEOUT_MS || '', 10);
+  return {
+    baseUrl: (process.env.LLM_API_BASE_URL || '').trim().replace(/\/+$/, ''),
+    apiKey: (process.env.LLM_API_KEY || '').trim(),
+    model: (process.env.LLM_MODEL || '').trim(),
+    timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 25000,
+  };
+}
+
+function llmConfigured() {
+  const c = getLLMConfig();
+  return !!(c.baseUrl && c.apiKey && c.model);
+}
+
+// FNV-1a 32-bit hash. Fast, dependency-free, good enough for change detection
+// of multi-KB changelog text. Returned as an 8-char hex string.
+function hashText(text) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i);
+    h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
+  }
+  return ('00000000' + h.toString(16)).slice(-8);
+}
+
+// Call an OpenAI-compatible /chat/completions endpoint to translate the
+// changelog text into Simplified Chinese. Returns { ok, translation } on
+// success or { ok: false, reason } on failure.
+async function translateChangelogToZh(text) {
+  const cfg = getLLMConfig();
+  if (!llmConfigured()) {
+    return { ok: false, reason: 'not_configured' };
+  }
+  // Guard against absurdly long inputs that would blow the context window.
+  // If the changelog ever grows past this, we still translate the head.
+  const MAX_CHARS = 24000;
+  const payload = text.length > MAX_CHARS
+    ? text.slice(0, MAX_CHARS) + '\n\n[... truncated for translation ...]'
+    : text;
+
+  const systemPrompt = [
+    'You are a professional software-release-note translator.',
+    'Translate the user message from English into Simplified Chinese (简体中文).',
+    'Rules:',
+    '- Preserve all version numbers, dates, commit hashes, file names, and URLs verbatim.',
+    '- Preserve Markdown/whitespace structure, bullet points, headings, and code blocks.',
+    '- Keep the same line breaks; do not merge or split lines.',
+    '- Translate prose naturally; do not add explanations, notes, or "Translation:" prefixes.',
+    '- Output ONLY the translated text.',
+  ].join('\n');
+
+  const url = `${cfg.baseUrl}/chat/completions`;
+  let resp;
+  try {
+    resp = await fetchWithTimeout(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${cfg.apiKey}`,
+      },
+      body: JSON.stringify({
+        model: cfg.model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: payload },
+        ],
+        temperature: 0.2,
+        stream: false,
+      }),
+    }, cfg.timeoutMs);
+  } catch (e) {
+    return { ok: false, reason: 'fetch_failed', detail: describeFetchError(e) };
+  }
+
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    return { ok: false, reason: 'http_error', detail: `LLM HTTP ${resp.status}: ${body.slice(0, 200)}` };
+  }
+
+  let data;
+  try {
+    data = await resp.json();
+  } catch (e) {
+    return { ok: false, reason: 'bad_json', detail: describeFetchError(e) };
+  }
+  const translation = data && data.choices && data.choices[0] && data.choices[0].message
+    && typeof data.choices[0].message.content === 'string'
+    ? data.choices[0].message.content.trim()
+    : '';
+  if (!translation) {
+    return { ok: false, reason: 'empty_content' };
+  }
+  return { ok: true, translation };
+}
+
+// Read the cached Chinese translation, but only trust it if its hash matches
+// the current source hash (otherwise the source changed and the translation
+// is stale). Returns null if no usable translation exists.
+async function getCachedTranslation(sourceHash) {
+  const store = getStoreInstance();
+  let zh = null;
+  try {
+    zh = await store.get('changelog/cached_zh', { type: 'json' });
+  } catch (_) {}
+  if (!zh || !zh.text || !zh.hash) return null;
+  if (sourceHash && zh.hash !== sourceHash) return null;
+  return zh;
+}
+
+// Translate the given source text and persist the result. Returns the stored
+// translation object on success, or null on failure.
+async function buildAndStoreTranslation(source) {
+  if (!llmConfigured()) return null;
+  const result = await translateChangelogToZh(source.text);
+  if (!result.ok) return null;
+  const zhData = {
+    text: result.translation,
+    sourceUrl: source.sourceUrl,
+    fetchedAt: source.fetchedAt,
+    translatedAt: new Date().toISOString(),
+    hash: source.hash,
+    translationStatus: 'done',
+  };
+  const store = getStoreInstance();
+  await store.setJSON('changelog/cached_zh', zhData);
+  return zhData;
+}
+
 // ---------- Koa setup ----------
 
 const app = new Koa();
@@ -363,6 +509,7 @@ router.get('/', (ctx) => {
       'GET /api/download-chunk?platform=<id>&index=<n>': 'Fetch a single chunk (avoids the function response size cap)',
       'GET /api/download?platform=<id>': 'Legacy single-shot stream — will 413 for large files; prefer the manifest flow',
       'GET /api/changelog?force=<bool>': 'Fetch and cache the cursor.com changelog page as text',
+      'GET /api/changelog?lang=zh': 'Get the Simplified-Chinese LLM translation of the cached changelog (auto-generated when source changes)',
     },
   };
 });
@@ -991,22 +1138,133 @@ async function fetchAndCacheChangelog() {
       .trim();
   }
 
+  const newHash = hashText(text);
+  const store = getStoreInstance();
+
+  // Read the previously cached source so we can detect whether the upstream
+  // changelog actually changed. If the hash matches, we keep the existing
+  // translation status (no need to re-translate an identical text).
+  let previous = null;
+  try {
+    previous = await store.get('changelog/cached', { type: 'json' });
+  } catch (_) {}
+  const sameContent = previous && previous.hash && previous.hash === newHash;
+
   const changelogData = {
     text,
     sourceUrl: 'https://www.cursor.com/changelog',
     fetchedAt: new Date().toISOString(),
+    hash: newHash,
   };
 
-  const store = getStoreInstance();
+  if (sameContent && previous) {
+    // Content unchanged — preserve the previous fetch time + translation
+    // status so we don't churn the cache or trigger needless LLM calls.
+    changelogData.fetchedAt = previous.fetchedAt;
+    changelogData.translationStatus = previous.translationStatus || (llmConfigured() ? 'pending' : 'none');
+    changelogData.translatedAt = previous.translatedAt || null;
+    await store.setJSON('changelog/cached', changelogData);
+    return changelogData;
+  }
+
+  // Content is new (or first cache). Decide what to do about translation:
+  //   - LLM not configured → translationStatus='none', move on.
+  //   - A matching cached translation already exists → reuse it.
+  //   - Otherwise → synchronously call the LLM once; if it succeeds, mark
+  //     'done'; if it fails, mark 'failed' so the client can show the
+  //     "translation unavailable" state instead of looping forever.
+  if (!llmConfigured()) {
+    changelogData.translationStatus = 'none';
+    changelogData.translatedAt = null;
+    await store.setJSON('changelog/cached', changelogData);
+    return changelogData;
+  }
+
+  const existingZh = await getCachedTranslation(newHash);
+  if (existingZh) {
+    changelogData.translationStatus = 'done';
+    changelogData.translatedAt = existingZh.translatedAt;
+    await store.setJSON('changelog/cached', changelogData);
+    return changelogData;
+  }
+
+  // Mark pending, persist the source first so a crash mid-translation still
+  // leaves the original changelog readable, then attempt the LLM call.
+  changelogData.translationStatus = 'pending';
+  changelogData.translatedAt = null;
+  await store.setJSON('changelog/cached', changelogData);
+
+  const zh = await buildAndStoreTranslation(changelogData);
+  if (zh) {
+    changelogData.translationStatus = 'done';
+    changelogData.translatedAt = zh.translatedAt;
+  } else {
+    changelogData.translationStatus = 'failed';
+  }
   await store.setJSON('changelog/cached', changelogData);
   return changelogData;
 }
 
 router.get('/api/changelog', async (ctx) => {
   const force = ctx.query.force === 'true' || ctx.query.force === '1';
+  const lang = ctx.query.lang === 'zh' ? 'zh' : 'orig';
   const store = getStoreInstance();
   const startedAt = Date.now();
 
+  // ---------- Chinese translation branch (?lang=zh) ----------
+  // The translation is keyed by the source hash, so we always need the
+  // current source object first to know which hash to look up / translate.
+  if (lang === 'zh') {
+    // Make sure we have a source changelog. Don't auto-refresh from
+    // cursor.com here — that's the original-language branch's job. If there
+    // is no cache at all, fall through to a 404 with a helpful message.
+    let source = null;
+    try {
+      source = await store.get('changelog/cached', { type: 'json' });
+    } catch (_) {}
+
+    if (source && source.hash) {
+      // 1. Reuse a matching cached translation.
+      let zh = await getCachedTranslation(source.hash);
+      // 2. If the LLM is configured but the translation is missing/failed,
+      //    try to produce it on demand so the user's first click still works.
+      if (!zh && llmConfigured() && source.translationStatus !== 'pending') {
+        zh = await buildAndStoreTranslation(source);
+        if (zh) {
+          source.translationStatus = 'done';
+          source.translatedAt = zh.translatedAt;
+          try { await store.setJSON('changelog/cached', source); } catch (_) {}
+        }
+      }
+      if (zh) {
+        ctx.set('Cache-Control', 'no-store');
+        ctx.body = { changelog: zh, durationMs: Date.now() - startedAt };
+        return;
+      }
+      // No translation available right now.
+      ctx.status = 404;
+      ctx.body = {
+        error: 'translation_unavailable',
+        translationStatus: source.translationStatus || (llmConfigured() ? 'pending' : 'none'),
+        detail: llmConfigured()
+          ? 'Translation is not ready yet. Try the original text and switch back in a few seconds.'
+          : 'Server LLM is not configured (LLM_API_BASE_URL / LLM_API_KEY / LLM_MODEL).',
+        durationMs: Date.now() - startedAt,
+      };
+      return;
+    }
+
+    // No source changelog at all — ask the client to load the original first.
+    ctx.status = 404;
+    ctx.body = {
+      error: 'no_changelog',
+      detail: 'Changelog has not been fetched yet. Open the changelog once to populate the cache, then switch to 简体中文.',
+      durationMs: Date.now() - startedAt,
+    };
+    return;
+  }
+
+  // ---------- Original-language branch ----------
   let changelog = null;
   if (!force) {
     try {
