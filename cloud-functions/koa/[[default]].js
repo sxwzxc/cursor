@@ -1323,6 +1323,14 @@ router.get('/api/changelog', async (ctx) => {
       source = await store.get('changelog/cached', { type: 'json' });
     } catch (_) {}
 
+    // Migration: blobs written by older code have no `hash` field. Derive it
+    // from the text on the fly so the translation lookup/trigger still works,
+    // and persist the backfilled hash so subsequent reads are cheap.
+    if (source && source.text && !source.hash) {
+      source.hash = hashText(source.text);
+      try { await store.setJSON('changelog/cached', source); } catch (_) {}
+    }
+
     if (source && source.hash) {
       // 1. Reuse a matching cached translation.
       let zh = await getCachedTranslation(source.hash);
