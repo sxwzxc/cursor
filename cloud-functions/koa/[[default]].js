@@ -1487,7 +1487,7 @@ function parseModelsFromChunk(js) {
   if (names.length === 0) return [];
 
   const fld = (seg, key) => {
-    const r = new RegExp(key + ':(!0|!1|true|false|"[^"]*"|\\d+\\.?\\d*|\\[[^\\]]*\\])');
+    const r = new RegExp(key + ':(!0|!1|true|false|"[^"]*"|\\d*\\.?\\d+|\\[[^\\]]*\\])');
     const mm = seg.match(r);
     if (!mm) return null;
     const v = mm[1];
@@ -1578,9 +1578,19 @@ async function fetchAndCacheModels() {
   const srcRe = /<script[^>]*\ssrc=["']([^"']+)["']/gi;
   let mm;
   while ((mm = srcRe.exec(html)) !== null) srcs.push(mm[1]);
-  const base = MODELS_SOURCE_URL.replace(/\/[^/]*$/, '');
+  // Resolve chunk URLs. The docs page references chunks as root-relative
+  // paths like "/docs-static/_next/static/chunks/xxx.js" — these must be
+  // joined to the ORIGIN (https://cursor.com), not to the docs path
+  // (https://cursor.com/docs), otherwise the URL becomes
+  // "/docs/docs-static/..." and returns 404.
+  const origin = new URL(MODELS_SOURCE_URL).origin;
   const absUrls = srcs
-    .map((s) => (s.startsWith('http') ? s : s.startsWith('//') ? 'https:' + s : base + s))
+    .map((s) => {
+      if (s.startsWith('http')) return s;
+      if (s.startsWith('//')) return 'https:' + s;
+      if (s.startsWith('/')) return origin + s;
+      return origin + '/' + s;
+    })
     // only the docs-static chunk pool
     .filter((s) => /\/_next\/static\/chunks\//.test(s));
   if (absUrls.length === 0) {
@@ -1600,7 +1610,12 @@ async function fetchAndCacheModels() {
       }, { tries: 1, timeoutMs: 9000 });
       if (!r.ok) return null;
       const body = await r.text();
-      return body.indexOf('tokenInput:') !== -1 ? body : null;
+      // Match `tokenInput:<digit>` — the DATA chunk has `tokenInput:3` (a
+      // literal price), while the COMPONENT chunk only has `tokenInput:a.x`
+      // (a property accessor). This discriminator avoids picking the wrong
+      // chunk when the component logic appears before the data in the
+      // script list.
+      return /tokenInput:\d/.test(body) ? body : null;
     }));
     for (const res of results) {
       if (res.status === 'fulfilled' && res.value) { dataChunk = res.value; break; }
