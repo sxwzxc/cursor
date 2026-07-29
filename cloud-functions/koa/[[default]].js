@@ -394,28 +394,33 @@ function hashText(text) {
   return ('00000000' + h.toString(16)).slice(-8);
 }
 
-// Call an OpenAI-compatible /chat/completions endpoint to translate the
-// changelog text into Simplified Chinese. Returns { ok, translation } on
-// success or { ok: false, reason } on failure.
-async function translateChangelogToZh(text) {
+// Call an OpenAI-compatible /chat/completions endpoint to translate text
+// into Simplified Chinese. Returns { ok, translation } on success or
+// { ok: false, reason } on failure. `kind` ("changelog" | "models") only
+// tunes the first line of the system prompt; the structural rules are shared
+// because both sources are technical docs with tables/URLs/numbers.
+async function translateToZh(text, kind = 'changelog') {
   const cfg = getLLMConfig();
   if (!llmConfigured()) {
     return { ok: false, reason: 'not_configured' };
   }
   // Guard against absurdly long inputs that would blow the context window.
-  // If the changelog ever grows past this, we still translate the head.
+  // If the text ever grows past this, we still translate the head.
   const MAX_CHARS = 24000;
   const payload = text.length > MAX_CHARS
     ? text.slice(0, MAX_CHARS) + '\n\n[... truncated for translation ...]'
     : text;
 
+  const roleLine = kind === 'models'
+    ? 'You are a professional translator for software model & pricing documentation.'
+    : 'You are a professional software-release-note translator.';
   const systemPrompt = [
-    'You are a professional software-release-note translator.',
+    roleLine,
     'Translate the user message from English into Simplified Chinese (简体中文).',
     'Rules:',
-    '- Preserve all version numbers, dates, commit hashes, file names, and URLs verbatim.',
-    '- Preserve Markdown/whitespace structure, bullet points, headings, and code blocks.',
-    '- Keep the same line breaks; do not merge or split lines.',
+    '- Preserve all version numbers, dates, commit hashes, file names, model names (e.g. Claude, GPT, Gemini, Grok), prices, and URLs verbatim.',
+    '- Preserve Markdown/whitespace structure, bullet points, headings, code blocks, and table rows.',
+    '- Keep the same line breaks; do not merge or split lines or table cells.',
     '- Translate prose naturally; do not add explanations, notes, or "Translation:" prefixes.',
     '- Output ONLY the translated text.',
   ].join('\n');
@@ -466,12 +471,13 @@ async function translateChangelogToZh(text) {
 
 // Read the cached Chinese translation, but only trust it if its hash matches
 // the current source hash (otherwise the source changed and the translation
-// is stale). Returns null if no usable translation exists.
-async function getCachedTranslation(sourceHash) {
+// is stale). Returns null if no usable translation exists. `zhBlobKey`
+// selects which cache to read (e.g. 'changelog/cached_zh' or 'models/cached_zh').
+async function getCachedTranslation(sourceHash, zhBlobKey) {
   const store = getStoreInstance();
   let zh = null;
   try {
-    zh = await store.get('changelog/cached_zh', { type: 'json' });
+    zh = await store.get(zhBlobKey, { type: 'json' });
   } catch (_) {}
   if (!zh || !zh.text || !zh.hash) return null;
   if (sourceHash && zh.hash !== sourceHash) return null;
@@ -479,19 +485,20 @@ async function getCachedTranslation(sourceHash) {
 }
 
 // Translate the given source text and persist the result. Returns the stored
-// translation object on success, or null on failure.
-async function buildAndStoreTranslation(source) {
+// translation object on success, or null on failure. `zhBlobKey` selects the
+// cache to write; `kind` tunes the LLM system prompt (see translateToZh).
+async function buildAndStoreTranslation(source, zhBlobKey, kind) {
   if (!llmConfigured()) {
-    console.log('[translate] skipped: llm not configured');
+    console.log('[translate] skipped: llm not configured', { zhBlobKey });
     return null;
   }
-  console.log('[translate] calling LLM', { hash: source.hash, textLen: source.text.length });
-  const result = await translateChangelogToZh(source.text);
+  console.log('[translate] calling LLM', { zhBlobKey, hash: source.hash, textLen: source.text.length });
+  const result = await translateToZh(source.text, kind);
   if (!result.ok) {
-    console.log('[translate] failed', { reason: result.reason, detail: result.detail });
+    console.log('[translate] failed', { zhBlobKey, reason: result.reason, detail: result.detail });
     return null;
   }
-  console.log('[translate] success', { translationLen: result.translation.length });
+  console.log('[translate] success', { zhBlobKey, translationLen: result.translation.length });
   const zhData = {
     text: result.translation,
     sourceUrl: source.sourceUrl,
@@ -501,7 +508,7 @@ async function buildAndStoreTranslation(source) {
     translationStatus: 'done',
   };
   const store = getStoreInstance();
-  await store.setJSON('changelog/cached_zh', zhData);
+  await store.setJSON(zhBlobKey, zhData);
   return zhData;
 }
 
@@ -550,6 +557,7 @@ router.get('/', (ctx) => {
       'GET /api/download?platform=<id>': 'Legacy single-shot stream — will 413 for large files; prefer the manifest flow',
       'GET /api/changelog?force=<bool>': 'Fetch and cache the cursor.com changelog page as text',
       'GET /api/changelog?lang=zh': 'Get the Simplified-Chinese LLM translation of the cached changelog (auto-generated when source changes)',
+      'GET /api/models?force=<bool>&lang=zh|orig': 'Mirror cursor.com/docs/models-and-pricing (model list + pricing tables); ?lang=zh returns the LLM translation',
     },
   };
 });
@@ -628,7 +636,7 @@ router.get('/api/debug-translate', async (ctx) => {
     model: cfg.model,
     keyLen: cfg.apiKey.length,
   });
-  const result = await translateChangelogToZh('Bug fixes and performance improvements.');
+  const result = await translateToZh('Bug fixes and performance improvements.');
   console.log('[debug-translate] result', { ok: result.ok, reason: result.reason, detail: result.detail });
   ctx.set('Cache-Control', 'no-store');
   ctx.body = {
@@ -1280,7 +1288,7 @@ async function fetchAndCacheChangelog() {
     return changelogData;
   }
 
-  const existingZh = await getCachedTranslation(newHash);
+  const existingZh = await getCachedTranslation(newHash, 'changelog/cached_zh');
   if (existingZh) {
     changelogData.translationStatus = 'done';
     changelogData.translatedAt = existingZh.translatedAt;
@@ -1294,7 +1302,7 @@ async function fetchAndCacheChangelog() {
   changelogData.translatedAt = null;
   await store.setJSON('changelog/cached', changelogData);
 
-  const zh = await buildAndStoreTranslation(changelogData);
+  const zh = await buildAndStoreTranslation(changelogData, 'changelog/cached_zh', 'changelog');
   if (zh) {
     changelogData.translationStatus = 'done';
     changelogData.translatedAt = zh.translatedAt;
@@ -1333,11 +1341,11 @@ router.get('/api/changelog', async (ctx) => {
 
     if (source && source.hash) {
       // 1. Reuse a matching cached translation.
-      let zh = await getCachedTranslation(source.hash);
+      let zh = await getCachedTranslation(source.hash, 'changelog/cached_zh');
       // 2. If the LLM is configured but the translation is missing/failed,
       //    try to produce it on demand so the user's first click still works.
       if (!zh && llmConfigured() && source.translationStatus !== 'pending') {
-        zh = await buildAndStoreTranslation(source);
+        zh = await buildAndStoreTranslation(source, 'changelog/cached_zh', 'changelog');
         if (zh) {
           source.translationStatus = 'done';
           source.translatedAt = zh.translatedAt;
@@ -1405,6 +1413,227 @@ router.get('/api/changelog', async (ctx) => {
 
   ctx.set('Cache-Control', 'no-store');
   ctx.body = { changelog, durationMs: Date.now() - startedAt };
+});
+
+// ---------- Models & Pricing ----------
+
+// Shared HTML→text extractor used by both changelog and models mirroring.
+// Strips script/style/nav/header/footer, isolates <main>/<article>, converts
+// block tags to newlines, decodes entities, and collapses whitespace.
+function htmlToReadableText(html) {
+  let content = html;
+  content = content.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+  content = content.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+  content = content.replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '');
+  content = content.replace(/<svg[^>]*>[\s\S]*?<\/svg>/gi, '');
+  content = content.replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '');
+  content = content.replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '');
+  content = content.replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '');
+  content = content.replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, '');
+  content = content.replace(/<link[^>]*>/gi, '');
+  content = content.replace(/<meta[^>]*>/gi, '');
+  content = content.replace(/<!--[\s\S]*?-->/g, '');
+
+  let mainContent = '';
+  const mainMatch = content.match(/<main[^>]*>([\s\S]*?)<\/main>/i);
+  if (mainMatch) {
+    mainContent = mainMatch[1];
+  } else {
+    const articleMatch = content.match(/<article[^>]*>([\s\S]*?)<\/article>/i);
+    if (articleMatch) mainContent = articleMatch[1];
+  }
+  let text = mainContent || content;
+
+  const decode = (s) => s
+    .replace(/<\/(p|div|section|article|h[1-6]|li|ul|ol|tr|table|tbody|thead|br)>/gi, '\n')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<li[^>]*>/gi, '\n• ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ').replace(/&mdash;/g, '—').replace(/&ndash;/g, '–')
+    .replace(/&hellip;/g, '…')
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  text = decode(text);
+  // Fallback: if <main> extraction was too aggressive (very short), decode
+  // the whole stripped content instead.
+  if (text.length < 200) text = decode(content);
+  return text;
+}
+
+const MODELS_SOURCE_URL = 'https://cursor.com/docs/models-and-pricing';
+const MODELS_SOURCE_BLOB = 'models/cached';
+const MODELS_ZH_BLOB = 'models/cached_zh';
+
+// Fetch the cursor.com Models & Pricing docs page, extract readable text,
+// and cache it in blob storage. Mirrors fetchAndCacheChangelog: detects
+// content changes via hash, auto-triggers an LLM translation to Simplified
+// Chinese when the source changes, and caches the translation by hash.
+async function fetchAndCacheModels() {
+  const resp = await fetchWithRetry(MODELS_SOURCE_URL, {
+    method: 'GET',
+    headers: { ...FETCH_HEADERS, Accept: 'text/html,application/xhtml+xml' },
+    redirect: 'follow',
+  }, { tries: 3, timeoutMs: 10000 });
+  if (!resp.ok) {
+    throw new Error(`cursor.com models fetch failed: HTTP ${resp.status}`);
+  }
+  const html = await resp.text();
+  const text = htmlToReadableText(html);
+  if (text.length < 200) {
+    throw new Error(`cursor.com models parse produced too-short text (${text.length} chars)`);
+  }
+
+  const newHash = hashText(text);
+  const store = getStoreInstance();
+
+  let previous = null;
+  try {
+    previous = await store.get(MODELS_SOURCE_BLOB, { type: 'json' });
+  } catch (_) {}
+  const sameContent = previous && previous.hash && previous.hash === newHash;
+
+  const modelsData = {
+    text,
+    sourceUrl: MODELS_SOURCE_URL,
+    fetchedAt: new Date().toISOString(),
+    hash: newHash,
+  };
+
+  if (sameContent && previous) {
+    modelsData.fetchedAt = previous.fetchedAt;
+    modelsData.translationStatus = previous.translationStatus || (llmConfigured() ? 'pending' : 'none');
+    modelsData.translatedAt = previous.translatedAt || null;
+    await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
+    return modelsData;
+  }
+
+  if (!llmConfigured()) {
+    modelsData.translationStatus = 'none';
+    modelsData.translatedAt = null;
+    await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
+    return modelsData;
+  }
+
+  const existingZh = await getCachedTranslation(newHash, MODELS_ZH_BLOB);
+  if (existingZh) {
+    modelsData.translationStatus = 'done';
+    modelsData.translatedAt = existingZh.translatedAt;
+    await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
+    return modelsData;
+  }
+
+  modelsData.translationStatus = 'pending';
+  modelsData.translatedAt = null;
+  await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
+
+  const zh = await buildAndStoreTranslation(modelsData, MODELS_ZH_BLOB, 'models');
+  if (zh) {
+    modelsData.translationStatus = 'done';
+    modelsData.translatedAt = zh.translatedAt;
+  } else {
+    modelsData.translationStatus = 'failed';
+  }
+  await store.setJSON(MODELS_SOURCE_BLOB, modelsData);
+  return modelsData;
+}
+
+// GET /api/models?force=<bool>&lang=zh|orig
+// Mirrors /api/changelog: mirrors cursor.com/docs/models-and-pricing, caches
+// the extracted text, and (when lang=zh) returns the LLM-translated Chinese
+// version. The cron job calls ?force=true daily so the cache stays fresh.
+router.get('/api/models', async (ctx) => {
+  const force = ctx.query.force === 'true' || ctx.query.force === '1';
+  const lang = ctx.query.lang === 'zh' ? 'zh' : 'orig';
+  const store = getStoreInstance();
+  const startedAt = Date.now();
+
+  if (lang === 'zh') {
+    let source = null;
+    try {
+      source = await store.get(MODELS_SOURCE_BLOB, { type: 'json' });
+    } catch (_) {}
+
+    // Migration: backfill hash for blobs written before hashing existed.
+    if (source && source.text && !source.hash) {
+      source.hash = hashText(source.text);
+      try { await store.setJSON(MODELS_SOURCE_BLOB, source); } catch (_) {}
+    }
+
+    if (source && source.hash) {
+      let zh = await getCachedTranslation(source.hash, MODELS_ZH_BLOB);
+      if (!zh && llmConfigured() && source.translationStatus !== 'pending') {
+        zh = await buildAndStoreTranslation(source, MODELS_ZH_BLOB, 'models');
+        if (zh) {
+          source.translationStatus = 'done';
+          source.translatedAt = zh.translatedAt;
+          try { await store.setJSON(MODELS_SOURCE_BLOB, source); } catch (_) {}
+        }
+      }
+      if (zh) {
+        ctx.set('Cache-Control', 'no-store');
+        ctx.body = { models: zh, durationMs: Date.now() - startedAt };
+        return;
+      }
+      ctx.status = 404;
+      ctx.body = {
+        error: 'translation_unavailable',
+        translationStatus: source.translationStatus || (llmConfigured() ? 'pending' : 'none'),
+        detail: llmConfigured()
+          ? 'Translation is not ready yet. Try the original text and switch back in a few seconds.'
+          : 'EdgeOne Makers AI Gateway key is not configured (AI_GATEWAY_API_KEY).',
+        durationMs: Date.now() - startedAt,
+      };
+      return;
+    }
+
+    ctx.status = 404;
+    ctx.body = {
+      error: 'no_models',
+      detail: 'Models page has not been fetched yet. Open the models view once to populate the cache, then switch to 简体中文.',
+      durationMs: Date.now() - startedAt,
+    };
+    return;
+  }
+
+  let models = null;
+  if (!force) {
+    try {
+      models = await store.get(MODELS_SOURCE_BLOB, { type: 'json' });
+    } catch (_) {}
+  }
+
+  if (!models) {
+    try {
+      models = await fetchAndCacheModels();
+    } catch (e) {
+      if (!force) {
+        try {
+          models = await store.get(MODELS_SOURCE_BLOB, { type: 'json' });
+        } catch (_) {}
+      }
+      if (models) {
+        ctx.body = {
+          models,
+          warning: `Failed to refresh from cursor.com: ${describeFetchError(e)}. Showing cached version from ${models.fetchedAt}.`,
+          durationMs: Date.now() - startedAt,
+        };
+        return;
+      }
+      ctx.status = 502;
+      ctx.body = { error: 'fetch_models_failed', detail: describeFetchError(e), durationMs: Date.now() - startedAt };
+      return;
+    }
+  }
+
+  ctx.set('Cache-Control', 'no-store');
+  ctx.body = { models, durationMs: Date.now() - startedAt };
 });
 
 app.use(router.routes());

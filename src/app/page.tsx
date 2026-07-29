@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
-import { Download, RefreshCw, CheckCircle2, AlertCircle, Loader2, FileDown, Zap, X, BookOpen, Languages } from "lucide-react";
+import { Download, RefreshCw, CheckCircle2, AlertCircle, Loader2, FileDown, Zap, X, BookOpen, Languages, Layers } from "lucide-react";
 
 interface LatestInfo {
   platform: string;
@@ -114,6 +114,12 @@ export default function Home() {
   const [changelogLang, setChangelogLang] = useState<"orig" | "zh">("orig");
   const [zhLoading, setZhLoading] = useState(false);
   const [showChangelog, setShowChangelog] = useState(false);
+  const [models, setModels] = useState<ChangelogData | null>(null);
+  const [modelsZh, setModelsZh] = useState<ChangelogData | null>(null);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsLang, setModelsLang] = useState<"orig" | "zh">("orig");
+  const [modelsZhLoading, setModelsZhLoading] = useState(false);
+  const [showModels, setShowModels] = useState(false);
   const platformRef = useRef(platform);
   platformRef.current = platform;
 
@@ -354,6 +360,57 @@ export default function Home() {
     }
   };
 
+  // Open the Models & Pricing mirror. Lazily fetches the cached text on
+  // first open; if a translation already exists server-side, prefetch it so
+  // the 简体中文 toggle is instant.
+  const handleModels = async () => {
+    setShowModels(true);
+    setModelsLang("orig");
+    if (models) return;
+    setModelsLoading(true);
+    try {
+      const resp = await fetch("/koa/api/models");
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || data.error || "获取模型与价目表失败");
+      setModels(data.models);
+      if (data.models?.translationStatus === "done") {
+        try {
+          const zhResp = await fetch("/koa/api/models?lang=zh");
+          const zhData = await zhResp.json();
+          if (zhResp.ok && zhData.models) setModelsZh(zhData.models);
+        } catch (_) {}
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "获取模型与价目表失败");
+    } finally {
+      setModelsLoading(false);
+    }
+  };
+
+  // Lazily fetch the Chinese translation of the models page when toggled.
+  const handleModelsSwitchToZh = async () => {
+    setModelsLang("zh");
+    if (modelsZh) return;
+    setModelsZhLoading(true);
+    try {
+      const resp = await fetch("/koa/api/models?lang=zh");
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.detail || data.error || "翻译获取失败");
+      setModelsZh(data.models);
+      if (models && data.models) {
+        setModels({
+          ...models,
+          translationStatus: data.models.translationStatus,
+          translatedAt: data.models.translatedAt,
+        });
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "翻译获取失败");
+    } finally {
+      setModelsZhLoading(false);
+    }
+  };
+
   const onPlatformChange = (id: string) => {
     setPlatform(id);
     setCheckResult(null);
@@ -409,13 +466,22 @@ export default function Home() {
               <p className="text-[10px] text-gray-500">cursor.sxwzxc.cn</p>
             </div>
           </div>
-          <button
-            onClick={handleChangelog}
-            className="flex cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs text-gray-400 transition-colors hover:bg-white/5 hover:text-white"
-          >
-            <BookOpen className="h-3.5 w-3.5" />
-            更新日志
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={handleModels}
+              className="flex cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs text-gray-400 transition-colors hover:bg-white/5 hover:text-white"
+            >
+              <Layers className="h-3.5 w-3.5" />
+              模型与价目
+            </button>
+            <button
+              onClick={handleChangelog}
+              className="flex cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs text-gray-400 transition-colors hover:bg-white/5 hover:text-white"
+            >
+              <BookOpen className="h-3.5 w-3.5" />
+              更新日志
+            </button>
+          </div>
         </div>
       </header>
 
@@ -704,6 +770,8 @@ GET  /koa/api/download-manifest?platform=  分片清单
 GET  /koa/api/download-chunk?platform=&index=  下载单个分片
 GET  /koa/api/changelog?force=<bool>   获取并缓存更新日志
 GET  /koa/api/changelog?lang=zh        获取简体中文翻译
+GET  /koa/api/models?force=<bool>      获取并缓存模型与价目表
+GET  /koa/api/models?lang=zh           获取模型价目表简体中文翻译
 GET  /koa/api/debug-llm               (调试) 检查 LLM 环境变量配置
 GET  /koa/api/debug-translate          (调试) 测试一次 LLM 翻译调用`}
             </pre>
@@ -813,6 +881,108 @@ GET  /koa/api/debug-translate          (调试) 测试一次 LLM 翻译调用`}
                 )
               ) : changelog ? (
                 <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-gray-300">{changelog.text}</pre>
+              ) : (
+                <p className="py-12 text-center text-sm text-gray-500">无内容</p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Models & Pricing modal */}
+      {showModels && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+          onClick={() => setShowModels(false)}
+        >
+          <div
+            className="flex max-h-[85vh] w-full max-w-3xl flex-col rounded-xl border border-white/10 bg-[#0a0d14] shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-white/5 px-6 py-4">
+              <h3 className="flex items-center gap-2 text-base font-semibold">
+                <Layers className="h-4 w-4 text-[#1c66e5]" />
+                模型与价目
+                {models && (
+                  <span className="ml-2 text-[10px] font-normal text-gray-500">
+                    更新于 {new Date(models.fetchedAt).toLocaleString("zh-CN")}
+                  </span>
+                )}
+              </h3>
+              <div className="flex items-center gap-2">
+                {/* Language toggle */}
+                <div className="flex items-center rounded-md border border-white/10 bg-white/[0.03] p-0.5">
+                  <button
+                    onClick={() => setModelsLang("orig")}
+                    className={`flex items-center gap-1 rounded px-2.5 py-1 text-[11px] transition-all ${
+                      modelsLang === "orig"
+                        ? "bg-[#1c66e5] text-white"
+                        : "text-gray-400 hover:text-white"
+                    }`}
+                  >
+                    原文
+                  </button>
+                  <button
+                    onClick={handleModelsSwitchToZh}
+                    disabled={modelsZhLoading}
+                    className={`flex items-center gap-1 rounded px-2.5 py-1 text-[11px] transition-all ${
+                      modelsLang === "zh"
+                        ? "bg-[#1c66e5] text-white"
+                        : "text-gray-400 hover:text-white"
+                    } ${modelsZhLoading ? "opacity-60" : ""}`}
+                  >
+                    {modelsZhLoading ? (
+                      <Loader2 className="h-3 w-3 animate-spin" />
+                    ) : (
+                      <Languages className="h-3 w-3" />
+                    )}
+                    简体中文
+                    {models?.translationStatus === "done" && !modelsZhLoading && (
+                      <span className="ml-1 text-[9px] text-green-400">●</span>
+                    )}
+                  </button>
+                </div>
+                {models && (
+                  <a
+                    href={models.sourceUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="text-[11px] text-gray-400 transition-colors hover:text-white"
+                  >
+                    原文 ↗
+                  </a>
+                )}
+                <button
+                  onClick={() => setShowModels(false)}
+                  className="cursor-pointer text-gray-400 transition-colors hover:text-white"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto px-6 py-4">
+              {modelsLoading ? (
+                <div className="flex items-center justify-center py-12">
+                  <Loader2 className="h-6 w-6 animate-spin text-gray-400" />
+                  <span className="ml-3 text-sm text-gray-400">加载中…</span>
+                </div>
+              ) : modelsLang === "zh" ? (
+                modelsZhLoading ? (
+                  <div className="flex flex-col items-center justify-center py-12">
+                    <Loader2 className="h-6 w-6 animate-spin text-[#1c66e5]" />
+                    <span className="mt-3 text-sm text-gray-400">正在获取翻译…</span>
+                    <span className="mt-1 text-[11px] text-gray-600">首次翻译由大模型生成，可能需要数秒</span>
+                  </div>
+                ) : modelsZh ? (
+                  <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-gray-300">{modelsZh.text}</pre>
+                ) : (
+                  <div className="py-12 text-center">
+                    <p className="text-sm text-gray-400">翻译暂不可用</p>
+                    <p className="mt-1 text-[11px] text-gray-600">服务端未配置翻译 LLM，请稍后再试或查看原文</p>
+                  </div>
+                )
+              ) : models ? (
+                <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-gray-300">{models.text}</pre>
               ) : (
                 <p className="py-12 text-center text-sm text-gray-500">无内容</p>
               )}

@@ -1,4 +1,5 @@
-# 每天 0:00 (北京时间 = UTC 16:00) 自动检查并缓存 Cursor Windows 最新版。
+# 每天 0:00 (北京时间 = UTC 16:00) 自动检查并缓存 Cursor Windows 最新版，
+# 同时刷新更新日志与模型价目表的镜像缓存（内容变更时自动触发 LLM 翻译）。
 # GitHub Actions cron 使用 UTC，所以 cron 表达式为 "0 16 * * *"。
 # 注意：GitHub Actions cron 不保证准时，可能有最多 30 分钟的延迟。
 name: Daily Auto-Update Cursor
@@ -66,3 +67,32 @@ jobs:
           done
           echo "=== Reached max calls ($MAX_CALLS), stopping ==="
           echo "The download may still be in progress; next scheduled run will continue."
+
+      - name: Refresh changelog & models mirror
+        # Force-refresh the docs mirror caches so they stay current without
+        # relying on a user clicking the buttons. Each endpoint fetches
+        # cursor.com, diffs by hash, and only calls the LLM when content
+        # actually changed (so most days this is a cheap no-op).
+        run: |
+          set -euo pipefail
+          for path in changelog models; do
+            echo "=== Refresh /api/$path ==="
+            # force=true bypasses the read-cache fast path and re-fetches
+            # cursor.com. The LLM translation runs inline if the hash changed,
+            # so allow up to 60s per call.
+            curl -sS -m 60 "https://cursor.sxwzxc.cn/koa/api/$path?force=true" \
+              | python3 -c "
+          import sys, json
+          try:
+            d = json.load(sys.stdin)
+            k = '$path'
+            obj = d.get(k, {})
+            print(f\"  fetchedAt={obj.get('fetchedAt')}\")
+            print(f\"  hash={obj.get('hash')}\")
+            print(f\"  translationStatus={obj.get('translationStatus')}\")
+            print(f\"  textLen={len(obj.get('text',''))}\")
+            if d.get('warning'): print(f\"  warning={d.get('warning')}\")
+          except Exception as e:
+            print(f\"  parse error: {e}\")
+          " || echo "  (request failed)"
+          done
