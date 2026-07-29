@@ -1579,17 +1579,20 @@ async function fetchAndCacheModels() {
   let mm;
   while ((mm = srcRe.exec(html)) !== null) srcs.push(mm[1]);
   // Resolve chunk URLs. The docs page references chunks as root-relative
-  // paths like "/docs-static/_next/static/chunks/xxx.js" — these must be
-  // joined to the ORIGIN (https://cursor.com), not to the docs path
-  // (https://cursor.com/docs), otherwise the URL becomes
-  // "/docs/docs-static/..." and returns 404.
-  const origin = new URL(MODELS_SOURCE_URL).origin;
+  // paths like "/docs-static/_next/static/chunks/xxx.js". These must be
+  // joined to the ORIGIN of the FINAL url after redirect — cursor.com
+  // redirects to www.cursor.com, so resp.url gives the correct origin.
+  // (Using the hardcoded MODELS_SOURCE_URL origin would produce
+  // https://cursor.com/docs-static/... while the page was actually
+  // served from https://www.cursor.com — and using the docs PATH
+  // https://cursor.com/docs would yield a 404 /docs/docs-static/... )
+  const finalOrigin = resp.url ? new URL(resp.url).origin : new URL(MODELS_SOURCE_URL).origin;
   const absUrls = srcs
     .map((s) => {
       if (s.startsWith('http')) return s;
       if (s.startsWith('//')) return 'https:' + s;
-      if (s.startsWith('/')) return origin + s;
-      return origin + '/' + s;
+      if (s.startsWith('/')) return finalOrigin + s;
+      return finalOrigin + '/' + s;
     })
     // only the docs-static chunk pool
     .filter((s) => /\/_next\/static\/chunks\//.test(s));
