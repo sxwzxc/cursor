@@ -326,29 +326,51 @@ function metaToLatest(meta) {
 // OpenAI-compatible chat-completion LLM whenever the source text changes, and
 // cache the translation next to the original in blob storage.
 //
-// Configuration is via environment variables (all optional). When any of them
-// is missing the translation feature is silently disabled so the rest of the
-// site keeps working:
-//   LLM_API_BASE_URL — e.g. https://api.openai.com/v1, or an EdgeOne AI
-//                      Gateway endpoint. The `/chat/completions` path is
-//                      appended automatically.
-//   LLM_API_KEY      — Bearer token sent in the Authorization header.
-//   LLM_MODEL        — model id, e.g. gpt-4o-mini, hunyuan-pro, qwen-turbo…
-//   LLM_TIMEOUT_MS   — per-request timeout (default 25000, fits EdgeOne's
-//                      ~30s function cap with headroom for the fetch itself).
+// This project runs on EdgeOne Makers, which auto-injects an OpenAI-compatible
+// AI Gateway on deploy with a free monthly token quota. We read those env vars
+// first so translation works out of the box with zero extra configuration:
+//
+//   AI_GATEWAY_BASE_URL  — default https://ai-gateway.edgeone.link/v1
+//   AI_GATEWAY_API_KEY   — Bearer token (auto-injected by Makers)
+//   AI_GATEWAY_MODEL     — e.g. @makers/deepseek-v4-flash, @makers/hy3-prev
+//
+// For local dev or a non-Makers deploy, the generic LLM_* names are still
+// honoured as a fallback. If neither set is present the feature is silently
+// disabled and the rest of the site keeps working.
+//   LLM_API_BASE_URL / LLM_API_KEY / LLM_MODEL / LLM_TIMEOUT_MS
+const MAKERS_DEFAULT_BASE_URL = 'https://ai-gateway.edgeone.link/v1';
+const MAKERS_DEFAULT_MODEL = '@makers/deepseek-v4-flash';
+
 function getLLMConfig() {
+  const baseUrl = (
+    process.env.AI_GATEWAY_BASE_URL
+    || process.env.LLM_API_BASE_URL
+    || MAKERS_DEFAULT_BASE_URL
+  ).trim().replace(/\/+$/, '');
+  const apiKey = (
+    process.env.AI_GATEWAY_API_KEY
+    || process.env.LLM_API_KEY
+    || ''
+  ).trim();
+  const model = (
+    process.env.AI_GATEWAY_MODEL
+    || process.env.LLM_MODEL
+    || MAKERS_DEFAULT_MODEL
+  ).trim();
   const timeout = parseInt(process.env.LLM_TIMEOUT_MS || '', 10);
   return {
-    baseUrl: (process.env.LLM_API_BASE_URL || '').trim().replace(/\/+$/, ''),
-    apiKey: (process.env.LLM_API_KEY || '').trim(),
-    model: (process.env.LLM_MODEL || '').trim(),
+    baseUrl,
+    apiKey,
+    model,
     timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : 25000,
   };
 }
 
+// "Configured" means we have an API key. baseUrl + model both have sensible
+// Makers defaults, so on a Makers deploy only the key needs to be injected
+// (which Makers does automatically).
 function llmConfigured() {
-  const c = getLLMConfig();
-  return !!(c.baseUrl && c.apiKey && c.model);
+  return !!getLLMConfig().apiKey;
 }
 
 // FNV-1a 32-bit hash. Fast, dependency-free, good enough for change detection
@@ -1248,7 +1270,7 @@ router.get('/api/changelog', async (ctx) => {
         translationStatus: source.translationStatus || (llmConfigured() ? 'pending' : 'none'),
         detail: llmConfigured()
           ? 'Translation is not ready yet. Try the original text and switch back in a few seconds.'
-          : 'Server LLM is not configured (LLM_API_BASE_URL / LLM_API_KEY / LLM_MODEL).',
+          : 'EdgeOne Makers AI Gateway key is not configured (AI_GATEWAY_API_KEY).',
         durationMs: Date.now() - startedAt,
       };
       return;
