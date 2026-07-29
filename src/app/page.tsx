@@ -55,6 +55,7 @@ interface DownloadProgressInfo {
   fileName: string;
   chunkIndex: number;
   chunkTotal: number;
+  speedBps: number; // bytes per second (rolling average)
 }
 
 const PLATFORMS = [
@@ -69,6 +70,14 @@ function formatBytes(bytes: number): string {
   const units = ["B", "KB", "MB", "GB"];
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
   return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
+}
+
+// Format a download speed (bytes/sec) into a human-readable string like "2.35 MB/s".
+function formatSpeed(bps: number): string {
+  if (!bps || bps <= 0) return "—";
+  const units = ["B/s", "KB/s", "MB/s", "GB/s"];
+  const i = Math.min(Math.floor(Math.log(bps) / Math.log(1024)), units.length - 1);
+  return `${(bps / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
 }
 
 function shortCommit(c: string | null | undefined): string {
@@ -158,6 +167,23 @@ export default function Home() {
     setDownloadProgress(null);
     const start = Date.now();
     const timer = setInterval(() => setElapsed(Date.now() - start), 500);
+
+    // Rolling-average speed tracker. Each chunk download updates the speed
+    // estimate based on elapsed time and bytes received so far. We keep the
+    // last few samples to smooth out per-chunk variance.
+    const speedSamples: { t: number; bytes: number }[] = [];
+    const trackSpeed = (received: number) => {
+      const now = Date.now();
+      speedSamples.push({ t: now, bytes: received });
+      // keep last 6 samples (~each chunk) for a stable rolling average
+      if (speedSamples.length > 6) speedSamples.shift();
+      if (speedSamples.length < 2) return 0;
+      const first = speedSamples[0];
+      const dt = (now - first.t) / 1000;
+      if (dt <= 0) return 0;
+      return (received - first.bytes) / dt;
+    };
+
     try {
       // 1. Fetch the manifest describing how to reassemble the installer.
       const manifestResp = await fetch(`/koa/api/download-manifest?platform=${platform}`);
@@ -201,11 +227,13 @@ export default function Home() {
           const buf = await r.arrayBuffer();
           await writable.write(buf);
           received += buf.byteLength;
-          setDownloadProgress({ received, total: fileSize, fileName, chunkIndex: chunk.index + 1, chunkTotal: chunks.length });
+          const speed = trackSpeed(received);
+          setDownloadProgress({ received, total: fileSize, fileName, chunkIndex: chunk.index + 1, chunkTotal: chunks.length, speedBps: speed });
           setElapsed(Date.now() - start);
         }
         await writable.close();
-        setDownloadProgress({ received: fileSize, total: fileSize, fileName, chunkIndex: chunks.length, chunkTotal: chunks.length });
+        const speed = trackSpeed(fileSize);
+        setDownloadProgress({ received: fileSize, total: fileSize, fileName, chunkIndex: chunks.length, chunkTotal: chunks.length, speedBps: speed });
         return;
       }
 
@@ -218,7 +246,8 @@ export default function Home() {
         const buf = await r.arrayBuffer();
         parts.push(buf);
         received += buf.byteLength;
-        setDownloadProgress({ received, total: fileSize, fileName, chunkIndex: chunk.index + 1, chunkTotal: chunks.length });
+        const speed = trackSpeed(received);
+        setDownloadProgress({ received, total: fileSize, fileName, chunkIndex: chunk.index + 1, chunkTotal: chunks.length, speedBps: speed });
         setElapsed(Date.now() - start);
       }
       const blob = new Blob(parts, { type: "application/octet-stream" });
@@ -383,7 +412,28 @@ export default function Home() {
                   style={{ width: `${downloadPct}%` }}
                 />
               </div>
-              <div className="text-right mt-1 text-xs font-mono text-green-400">{downloadPct}%</div>
+              <div className="flex items-center justify-between mt-2">
+                <span className="text-xs font-mono text-green-400">
+                  {downloadPct}% · {formatSpeed(downloadProgress.speedBps)}
+                  {downloadProgress.speedBps > 0 && downloadPct < 100 && (() => {
+                    const remaining = downloadProgress.total - downloadProgress.received;
+                    const etaSec = remaining / downloadProgress.speedBps;
+                    if (etaSec > 0 && etaSec < 3600) {
+                      return ` · 剩余约 ${Math.ceil(etaSec)}s`;
+                    }
+                    return "";
+                  })()}
+                </span>
+                <span className="text-xs font-mono text-gray-500">
+                  {formatBytes(downloadProgress.received)} / {formatBytes(downloadProgress.total)}
+                </span>
+              </div>
+              <div className="mt-3 flex items-start gap-2 rounded-md bg-yellow-950/30 border border-yellow-800/50 px-3 py-2">
+                <AlertCircle className="w-4 h-4 text-yellow-400 flex-shrink-0 mt-0.5" />
+                <p className="text-xs text-yellow-300/90 leading-relaxed">
+                  由于分片下载方式特殊，<span className="text-yellow-200 font-medium">请保持此页面打开，不要关闭或切换标签页</span>，直至下载完成（100%）。关闭网页将中断下载。
+                </p>
+              </div>
             </CardContent>
           </Card>
         )}
