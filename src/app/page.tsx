@@ -703,7 +703,9 @@ POST /koa/api/auto-update?platform=   自动检查+下载（定时任务用）
 GET  /koa/api/download-manifest?platform=  分片清单
 GET  /koa/api/download-chunk?platform=&index=  下载单个分片
 GET  /koa/api/changelog?force=<bool>   获取并缓存更新日志
-GET  /koa/api/changelog?lang=zh        获取简体中文翻译`}
+GET  /koa/api/changelog?lang=zh        获取简体中文翻译
+GET  /koa/api/debug-llm               (调试) 检查 LLM 环境变量配置
+GET  /koa/api/debug-translate          (调试) 测试一次 LLM 翻译调用`}
             </pre>
           </div>
         </details>

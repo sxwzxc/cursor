@@ -481,9 +481,17 @@ async function getCachedTranslation(sourceHash) {
 // Translate the given source text and persist the result. Returns the stored
 // translation object on success, or null on failure.
 async function buildAndStoreTranslation(source) {
-  if (!llmConfigured()) return null;
+  if (!llmConfigured()) {
+    console.log('[translate] skipped: llm not configured');
+    return null;
+  }
+  console.log('[translate] calling LLM', { hash: source.hash, textLen: source.text.length });
   const result = await translateChangelogToZh(source.text);
-  if (!result.ok) return null;
+  if (!result.ok) {
+    console.log('[translate] failed', { reason: result.reason, detail: result.detail });
+    return null;
+  }
+  console.log('[translate] success', { translationLen: result.translation.length });
   const zhData = {
     text: result.translation,
     sourceUrl: source.sourceUrl,
@@ -570,6 +578,66 @@ router.get('/api/latest', async (ctx) => {
     ctx.status = 502;
     ctx.body = { error: 'fetch_latest_failed', detail: describeFetchError(e) };
   }
+});
+
+// Debug endpoint — shows which env var names are populated and which LLM
+// config the code will actually use. Key values are masked so this is safe
+// to call on a public site. Used to diagnose "translation unavailable".
+router.get('/api/debug-llm', async (ctx) => {
+  const checked = ['apikey', 'MAKERS_MODELS_KEY', 'AI_GATEWAY_API_KEY', 'LLM_API_KEY'];
+  const sources = {};
+  for (const name of checked) {
+    const val = process.env[name];
+    sources[name] = val
+      ? { present: true, length: val.length, masked: `${val.slice(0, 4)}…${val.slice(-4)}` }
+      : { present: false };
+  }
+  const cfg = getLLMConfig();
+  // Surface any other env var whose name looks LLM-related, so if the key
+  // was named differently we can spot it.
+  const envKeys = Object.keys(process.env).filter((k) =>
+    /key|token|maker|gateway|llm|api/i.test(k),
+  );
+  ctx.set('Cache-Control', 'no-store');
+  ctx.body = {
+    configured: llmConfigured(),
+    resolved: {
+      baseUrl: cfg.baseUrl,
+      model: cfg.model,
+      apiKey: cfg.apiKey
+        ? { length: cfg.apiKey.length, masked: `${cfg.apiKey.slice(0, 4)}…${cfg.apiKey.slice(-4)}` }
+        : null,
+      timeoutMs: cfg.timeoutMs,
+    },
+    envSources: sources,
+    relatedEnvKeys: envKeys,
+    processEnvKeysCount: Object.keys(process.env).length,
+    processEnvSample: Object.keys(process.env).slice(0, 30),
+  };
+});
+
+// Debug endpoint — runs a real LLM translation call on a tiny test sentence
+// and returns the raw outcome (ok/fail, reason, detail). This lets us verify
+// end-to-end that the Makers gateway accepts our key, model and request shape
+// without depending on the cached changelog.
+router.get('/api/debug-translate', async (ctx) => {
+  const cfg = getLLMConfig();
+  console.log('[debug-translate] start', {
+    configured: llmConfigured(),
+    baseUrl: cfg.baseUrl,
+    model: cfg.model,
+    keyLen: cfg.apiKey.length,
+  });
+  const result = await translateChangelogToZh('Bug fixes and performance improvements.');
+  console.log('[debug-translate] result', { ok: result.ok, reason: result.reason, detail: result.detail });
+  ctx.set('Cache-Control', 'no-store');
+  ctx.body = {
+    input: 'Bug fixes and performance improvements.',
+    ok: result.ok,
+    reason: result.reason,
+    detail: result.detail,
+    translation: result.translation ? result.translation.slice(0, 200) : undefined,
+  };
 });
 
 router.get('/api/status', async (ctx) => {
