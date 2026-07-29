@@ -326,18 +326,25 @@ function metaToLatest(meta) {
 // OpenAI-compatible chat-completion LLM whenever the source text changes, and
 // cache the translation next to the original in blob storage.
 //
-// This project runs on EdgeOne Makers, which auto-injects an OpenAI-compatible
-// AI Gateway on deploy with a free monthly token quota. We read those env vars
-// first so translation works out of the box with zero extra configuration:
+// This project runs on EdgeOne Makers, whose Models 网关 is
+// OpenAI-compatible (https://ai-gateway.edgeone.link/v1) and ships several
+// free-tier built-in models prefixed with `@makers/`. See:
+//   https://cloud.tencent.com/document/product/1552/132760
 //
-//   AI_GATEWAY_BASE_URL  — default https://ai-gateway.edgeone.link/v1
-//   AI_GATEWAY_API_KEY   — Bearer token (auto-injected by Makers)
-//   AI_GATEWAY_MODEL     — e.g. @makers/deepseek-v4-flash, @makers/hy3-prev
+// The project has the Makers API key configured in the console under the env
+// var literally named `apikey`. We read that first, then fall back through
+// the official `MAKERS_MODELS_KEY` and the older `AI_GATEWAY_API_KEY` names
+// so the code keeps working regardless of how the key was named. The base
+// URL and model have sensible Makers defaults, so only the key is required.
 //
-// For local dev or a non-Makers deploy, the generic LLM_* names are still
-// honoured as a fallback. If neither set is present the feature is silently
-// disabled and the rest of the site keeps working.
-//   LLM_API_BASE_URL / LLM_API_KEY / LLM_MODEL / LLM_TIMEOUT_MS
+//   apikey             — project-configured Makers key (this project)
+//   MAKERS_MODELS_KEY  — official Makers key name (docs)
+//   AI_GATEWAY_API_KEY — older Makers-injected name (still seen in field guides)
+//   LLM_API_KEY        — generic local-dev fallback
+//   LLM_API_BASE_URL   — optional override (default Makers gateway)
+//   AI_GATEWAY_MODEL / LLM_MODEL — optional model override
+//                                  (default @makers/deepseek-v4-flash)
+//   LLM_TIMEOUT_MS     — per-request timeout (default 25000)
 const MAKERS_DEFAULT_BASE_URL = 'https://ai-gateway.edgeone.link/v1';
 const MAKERS_DEFAULT_MODEL = '@makers/deepseek-v4-flash';
 
@@ -347,8 +354,12 @@ function getLLMConfig() {
     || process.env.LLM_API_BASE_URL
     || MAKERS_DEFAULT_BASE_URL
   ).trim().replace(/\/+$/, '');
+  // Key lookup order: project-configured name → official Makers name →
+  // older Makers-injected name → generic local-dev fallback.
   const apiKey = (
-    process.env.AI_GATEWAY_API_KEY
+    process.env.apikey
+    || process.env.MAKERS_MODELS_KEY
+    || process.env.AI_GATEWAY_API_KEY
     || process.env.LLM_API_KEY
     || ''
   ).trim();
@@ -367,8 +378,7 @@ function getLLMConfig() {
 }
 
 // "Configured" means we have an API key. baseUrl + model both have sensible
-// Makers defaults, so on a Makers deploy only the key needs to be injected
-// (which Makers does automatically).
+// Makers defaults, so only the key needs to be present.
 function llmConfigured() {
   return !!getLLMConfig().apiKey;
 }
