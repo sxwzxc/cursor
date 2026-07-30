@@ -158,9 +158,12 @@ const FETCH_HEADERS = {
 };
 
 // HEAD the official endpoint, follow the redirect, read the production URL.
-async function getLatestVersionInfo(platform) {
+// `retryOpts` is forwarded to fetchWithRetry; callers that need a tighter
+// time budget (e.g. /api/check, which must stay under EdgeOne's ~30s
+// function cap) can pass { tries, timeoutMs }.
+async function getLatestVersionInfo(platform, retryOpts) {
   const cfg = PLATFORMS[platform];
-  const resp = await fetchWithRetry(cfg.url, { method: 'HEAD', redirect: 'follow', headers: FETCH_HEADERS });
+  const resp = await fetchWithRetry(cfg.url, { method: 'HEAD', redirect: 'follow', headers: FETCH_HEADERS }, retryOpts);
   if (!resp.ok) {
     throw new Error(`cursor.com HEAD failed: HTTP ${resp.status}`);
   }
@@ -178,7 +181,7 @@ async function getLatestVersionInfo(platform) {
   if (!version && platform !== VERSION_PROBE_PLATFORM) {
     try {
       const probe = PLATFORMS[VERSION_PROBE_PLATFORM];
-      const probeResp = await fetchWithRetry(probe.url, { method: 'HEAD', redirect: 'follow', headers: FETCH_HEADERS });
+      const probeResp = await fetchWithRetry(probe.url, { method: 'HEAD', redirect: 'follow', headers: FETCH_HEADERS }, retryOpts);
       if (probeResp.ok) {
         const probeInfo = parseVersionInfo(probeResp.url || '');
         version = probeInfo.version || null;
@@ -668,12 +671,25 @@ router.get('/api/check', async (ctx) => {
   }
   const startedAt = Date.now();
   let latest;
+  let warning = null;
   try {
-    latest = await getLatestVersionInfo(platform);
+    // Tighter budget than the default (4 tries × 8s ≈ 37s, which can blow
+    // past EdgeOne's ~30s function cap). 3 tries × 6s + backoff ≈ 20s max,
+    // leaving room for the cache read and response serialisation.
+    latest = await getLatestVersionInfo(platform, { tries: 3, timeoutMs: 6000, baseMs: 600 });
   } catch (e) {
-    ctx.status = 502;
-    ctx.body = { error: 'fetch_latest_failed', detail: describeFetchError(e), durationMs: Date.now() - startedAt };
-    return;
+    // cursor.com unreachable. Rather than surfacing a hard 502 ("出错了"),
+    // degrade gracefully: fall back to the cached meta so the user at least
+    // sees the version they already have, and flag it with a warning.
+    const cached = await getCachedMeta(platform);
+    if (cached && cached.status === 'ready') {
+      latest = metaToLatest(cached);
+      warning = `暂时无法连接 Cursor 官网（${describeFetchError(e)}），以下为本地缓存数据`;
+    } else {
+      ctx.status = 502;
+      ctx.body = { error: 'fetch_latest_failed', detail: describeFetchError(e), durationMs: Date.now() - startedAt };
+      return;
+    }
   }
   const cached = await getCachedMeta(platform);
   const ready = cached && cached.status === 'ready';
@@ -683,9 +699,9 @@ router.get('/api/check', async (ctx) => {
   if (needsUpdate) {
     reason = !cached ? 'no_cache' : !ready ? 'download_incomplete' : 'new_version';
   } else {
-    reason = 'up_to_date';
+    reason = warning ? 'up_to_date_cached' : 'up_to_date';
   }
-  ctx.body = { latest, cached, needsUpdate, reason, durationMs: Date.now() - startedAt };
+  ctx.body = { latest, cached, needsUpdate, reason, warning, durationMs: Date.now() - startedAt };
 });
 
 // Per-step update — downloads ONE chunk per invocation. This is the endpoint

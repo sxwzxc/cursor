@@ -39,6 +39,7 @@ interface CheckResult {
   needsUpdate: boolean;
   reason: string;
   durationMs: number;
+  warning?: string | null;
 }
 
 interface StatusResult {
@@ -166,6 +167,9 @@ export default function Home() {
       if (!resp.ok) throw new Error(data.detail || data.error || "检查失败");
       setCheckResult(data);
       setStatusResult({ cached: data.cached });
+      // 降级模式：cursor.com 不可达，后端返回了缓存数据 + warning。
+      // 显示为提示而非报错，让用户仍能看到已缓存的版本信息。
+      if (data.warning) setError(data.warning);
     } catch (e) {
       setError(e instanceof Error ? e.message : "检查失败");
       setCheckResult(null);
