@@ -662,6 +662,88 @@ router.get('/api/status', async (ctx) => {
   ctx.body = { cached };
 });
 
+// Debug endpoint — diagnose why EdgeOne functions cannot reach cursor.com.
+// Runs multiple probes (HEAD + GET, with and without redirect) against the
+// official download endpoint and returns a structured log. This is callable
+// via the public API so the site owner can inspect the failure without
+// needing EdgeOne console access.
+//
+// Query params:
+//   url=<https://...>   override the probe URL (default: the Windows golden
+//                       redirect endpoint, the same one /api/check uses)
+//   timeout=<ms>        per-attempt timeout (default 8000)
+router.get('/api/debug-conn', async (ctx) => {
+  const targetUrl = ctx.query.url || PLATFORMS['win32-x64-user'].url;
+  const timeoutMs = Math.min(parseInt(ctx.query.timeout, 10) || 8000, 15000);
+  const startedAt = Date.now();
+  const log = [];
+
+  const push = (phase, extra) => {
+    const entry = { t: Date.now() - startedAt, phase, ...(extra || {}) };
+    log.push(entry);
+    // Also emit to the function log stream so it shows up in EdgeOne console.
+    console.log(`[debug-conn] ${entry.t}ms ${phase}`, extra || {});
+  };
+
+  push('start', { url: targetUrl, timeoutMs, ua: FETCH_HEADERS['User-Agent'] });
+
+  const probe = async (label, method, redirect, headers) => {
+    const t0 = Date.now();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      push(`${label}:fetch_start`, { method, redirect });
+      const r = await fetch(targetUrl, {
+        method,
+        redirect,
+        headers: { ...FETCH_HEADERS, ...(headers || {}) },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      const elapsed = Date.now() - t0;
+      push(`${label}:response`, {
+        elapsed,
+        status: r.status,
+        statusText: r.statusText,
+        finalUrl: r.url,
+        redirected: r.redirected,
+        headers: {
+          'content-length': r.headers.get('content-length'),
+          'content-type': r.headers.get('content-type'),
+          location: r.headers.get('location'),
+          server: r.headers.get('server'),
+          via: r.headers.get('via'),
+          'cf-ray': r.headers.get('cf-ray'),
+          'x-edgeone': r.headers.get('x-edgeone') || r.headers.get('x-eo'),
+        },
+      });
+      return { ok: true, status: r.status, elapsed };
+    } catch (e) {
+      clearTimeout(timer);
+      const elapsed = Date.now() - t0;
+      const errInfo = describeFetchError(e);
+      push(`${label}:error`, { elapsed, error: errInfo, name: e.name, code: e.code });
+      return { ok: false, error: errInfo, elapsed };
+    }
+  };
+
+  const results = {};
+  results.head_follow = await probe('head_follow', 'HEAD', 'follow');
+  results.head_noredirect = await probe('head_noredirect', 'HEAD', 'manual');
+  results.get_follow = await probe('get_follow', 'GET', 'follow');
+
+  push('done', { totalMs: Date.now() - startedAt });
+
+  ctx.set('Cache-Control', 'no-store');
+  ctx.body = {
+    targetUrl,
+    timeoutMs,
+    totalMs: Date.now() - startedAt,
+    results,
+    log,
+  };
+});
+
 router.get('/api/check', async (ctx) => {
   const platform = ctx.query.platform;
   if (!isValidPlatform(platform)) {
