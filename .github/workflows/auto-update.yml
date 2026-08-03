@@ -109,7 +109,7 @@ jobs:
           set -euo pipefail
           for i in $(seq 1 12); do
             echo "=== Finalize attempt $i / 12 ==="
-            RESPONSE=$(curl -sS -m 25 "https://cursor.sxwzxc.cn/koa/api/changelog?lang=zh" 2>&1 || echo '{"error":"request_failed"}')
+            RESPONSE=$(curl -sS -m 30 "https://cursor.sxwzxc.cn/koa/api/changelog?lang=zh" 2>&1 || echo '{"error":"request_failed"}')
             STATUS=$(echo "$RESPONSE" | python3 -c "
           import sys, json
           try:

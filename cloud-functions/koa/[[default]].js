@@ -538,10 +538,13 @@ async function translateToZh(text, kind = 'changelog') {
 const SECTION_CHAR_LIMIT = 1500;   // max chars per section for a long text
 const SECTION_CONCURRENCY = 2;     // parallel LLM calls at once
 const SECTION_MAX_RETRIES = 2;     // per-section attempts (incl. the first)
-const SECTION_BUDGET_MS = 18000;   // per-pass cap (keeps even the background
-                                   // work from overlapping too much)
-const PASS_THROTTLE_MS = 8000;     // min gap between background passes
-                                   // (avoids piling up concurrent LLM calls)
+const SECTION_BUDGET_MS = 16000;   // per-pass cap. EdgeOne kills the function
+                                   // at ~30s and in-flight LLM calls can run
+                                   // ~10s past the budget, so 16s leaves a
+                                   // safe margin for the response.
+const PASS_THROTTLE_MS = 8000;     // min gap between translation passes
+                                   // (avoids piling up concurrent LLM calls
+                                   // from multiple clients/polls)
 
 // Split at changelog date headers like "Jul 29, 2026 · Changelog" (or
 // "3.11 Jul 10, 2026 · Changelog"). The header line stays with its section.
@@ -675,11 +678,14 @@ async function getCachedTranslation(sourceHash, zhBlobKey) {
   return zh;
 }
 
-// One background translation pass over `source.text`. Translates the
-// sections that are still missing (resuming from the per-section hashes
-// already persisted in `zhBlobKey`), and rewrites the assembled blob after
-// every section completes so partial progress survives process recycling.
-// Fire-and-forget: never throws. `kind` tunes the LLM system prompt.
+// One translation pass over `source.text`. Translates the sections that are
+// still missing (resuming from the per-section hashes already persisted in
+// `zhBlobKey`), and rewrites the assembled blob after every section
+// completes so partial progress survives even if the request is killed by
+// EdgeOne's ~30s function cap. Each pass runs within SECTION_BUDGET_MS of
+// LLM time; callers invoke it INLINE (awaited) — EdgeOne recycles the
+// process right after the response, so fire-and-forget work is unreliable.
+// Never throws. `kind` tunes the LLM system prompt.
 async function runTranslationPass(source, kind, zhBlobKey) {
   try {
     if (!llmConfigured()) {
@@ -1751,19 +1757,26 @@ router.get('/api/changelog', async (ctx) => {
         ctx.body = { changelog: zh, durationMs: Date.now() - startedAt };
         return;
       }
-      // 2. No usable translation. NEVER wait on the LLM here — EdgeOne kills
-      //    the process at ~30s, and a sectioned translation of the full
-      //    changelog needs several times that (gateway takes ~8-10s per
-      //    section). Instead kick off a background pass (throttled so polling
-      //    clients don't pile up concurrent LLM calls) and tell the client
-      //    to poll. Each pass resumes from sections already persisted, so
-      //    progress accumulates across requests/processes.
+      // 2. No usable translation. Run ONE resumable pass INLINE, bounded by
+      //    SECTION_BUDGET_MS so the request stays well under EdgeOne's ~30s
+      //    function cap. Each pass translates a few sections and persists
+      //    them; the client polls and the next request resumes from there.
+      //    Never wait on the full changelog in a single call — the gateway
+      //    takes ~8-10s per section, far too slow to finish inline.
       if (llmConfigured()) {
         const lastPass = source.passStartedAt ? Date.parse(source.passStartedAt) : 0;
         if (!Number.isFinite(lastPass) || Date.now() - lastPass > PASS_THROTTLE_MS) {
           source.passStartedAt = new Date().toISOString();
           try { await store.setJSON('changelog/cached', source); } catch (_) {}
-          runTranslationPass(source, 'changelog', 'changelog/cached_zh');
+          await runTranslationPass(source, 'changelog', 'changelog/cached_zh');
+        }
+        // Re-read after the pass — it may have finished (or partially
+        // finished) the translation within this request.
+        const zhAfter = await getCachedTranslation(source.hash, 'changelog/cached_zh');
+        if (zhAfter) {
+          ctx.set('Cache-Control', 'no-store');
+          ctx.body = { changelog: zhAfter, durationMs: Date.now() - startedAt };
+          return;
         }
       }
       ctx.status = 404;
