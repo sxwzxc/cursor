@@ -98,23 +98,35 @@ jobs:
           done
 
       - name: Finalize changelog translation
-        # The force-refresh marks a changed changelog as 'pending' and leaves
-        # the LLM work to be triggered on demand. This step triggers the
-        # sectioned on-demand translation so the Chinese changelog is ready
-        # even if no user ever clicks the toggle. Idempotent: returns
-        # immediately when a translation for the current hash already exists.
+        # The force-refresh marks a changed changelog as 'pending' and never
+        # blocks on the LLM (EdgeOne kills functions at ~30s, far too short
+        # to translate the whole changelog inline). Instead each lang=zh
+        # request kicks off a resumable background pass that translates a few
+        # sections and persists them, so we poll: every retry re-triggers a
+        # pass and picks up accumulated progress until the translation is
+        # 'done' (or we run out of attempts).
         run: |
-          echo "=== Finalize /api/changelog?lang=zh ==="
-          curl -sS -m 35 "https://cursor.sxwzxc.cn/koa/api/changelog?lang=zh" \
-            | python3 -c "
+          set -euo pipefail
+          for i in $(seq 1 12); do
+            echo "=== Finalize attempt $i / 12 ==="
+            RESPONSE=$(curl -sS -m 25 "https://cursor.sxwzxc.cn/koa/api/changelog?lang=zh" 2>&1 || echo '{"error":"request_failed"}')
+            STATUS=$(echo "$RESPONSE" | python3 -c "
           import sys, json
           try:
             d = json.load(sys.stdin)
             if d.get('changelog'):
               c = d['changelog']
-              print(f\"  translationStatus={c.get('translationStatus')} textLen={len(c.get('text',''))}\")
+              print('done' if c.get('translationStatus') == 'done' else c.get('translationStatus', 'pending'))
             else:
-              print(f\"  not ready: status={d.get('translationStatus')} reason={d.get('reason')} detail={d.get('detail','')}\")
-          except Exception as e:
-            print(f\"  parse error: {e}\")
-          " || echo "  (request failed)"
+              print(d.get('translationStatus', 'pending'))
+          except Exception:
+            print('pending')
+          " 2>/dev/null || echo "pending")
+            echo "  status=$STATUS"
+            if [ "$STATUS" = "done" ]; then
+              echo "=== Translation complete ==="
+              exit 0
+            fi
+            sleep 12
+          done
+          echo "=== Translation still in progress after 12 attempts, next scheduled run continues ==="

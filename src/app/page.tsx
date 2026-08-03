@@ -405,10 +405,11 @@ export default function Home() {
   };
 
   // Lazily fetch the Chinese translation when the user toggles to it. The
-  // server translates on demand, which takes several seconds the first time,
-  // and another request (background kick-off / cron) may already be working
-  // on it. So we poll: 'pending' keeps retrying, 'failed' surfaces the
-  // server's reason instead of spinning forever.
+  // server translates in the background in resumable passes (each request
+  // kicks one off, throttled) and persists sections as they complete, so the
+  // client polls: 'pending' keeps retrying, a 'partial' response is shown
+  // immediately while polling continues until 'done', and a definite failure
+  // ('none') surfaces the reason instead of spinning forever.
   const handleSwitchToZh = async () => {
     setChangelogLang("zh");
     setZhError("");
@@ -416,11 +417,13 @@ export default function Home() {
     setZhLoading(true);
     try {
       let lastData: { error?: string; translationStatus?: string; detail?: string; changelog?: ChangelogData } | null = null;
+      let gotAny = false;
       for (let attempt = 0; attempt < 30; attempt++) {
         const resp = await fetch("/koa/api/changelog?lang=zh");
         const data = await resp.json();
         lastData = data;
         if (resp.ok && data.changelog) {
+          gotAny = true;
           setChangelogZh(data.changelog);
           // Keep the original's translationStatus in sync so the badge updates.
           if (changelog && data.changelog) {
@@ -430,17 +433,18 @@ export default function Home() {
               translatedAt: data.changelog.translatedAt,
             });
           }
-          return;
+          if (data.changelog.translationStatus === "done") return;
+          // 'partial' — show what we have and keep polling; the background
+          // pass is still working on the remaining sections.
+          setZhLoading(false);
+        } else if (data.translationStatus === "none") {
+          if (!gotAny) throw new Error(data.detail || data.error || "翻译获取失败");
+          break;
         }
-        // Definite failure states — stop polling and tell the user why.
-        if (data.translationStatus === "failed" || data.translationStatus === "none") {
-          throw new Error(data.detail || data.error || "翻译获取失败");
-        }
-        // 'pending' (or missing status) — the translation is being generated;
-        // wait briefly and check again.
-        await new Promise((r) => setTimeout(r, 2000));
+        // 'pending' — the background pass is generating; wait and check again.
+        await new Promise((r) => setTimeout(r, 3000));
       }
-      throw new Error(lastData?.detail || "翻译生成超时，请稍后重试");
+      if (!gotAny) throw new Error(lastData?.detail || "翻译生成超时，请稍后重试");
     } catch (e) {
       const msg = e instanceof Error ? e.message : "翻译获取失败";
       setZhError(msg);
@@ -924,8 +928,8 @@ GET  /koa/api/debug-translate          (调试) 测试一次 LLM 翻译调用`}
                 zhLoading ? (
                   <div className="flex flex-col items-center justify-center py-12">
                     <Loader2 className="h-6 w-6 animate-spin text-[#1c66e5]" />
-                    <span className="mt-3 text-sm text-gray-400">正在获取翻译…</span>
-                    <span className="mt-1 text-[11px] text-gray-600">首次翻译由大模型生成，可能需要数秒，请稍候</span>
+                    <span className="mt-3 text-sm text-gray-400">正在生成翻译…</span>
+                    <span className="mt-1 text-[11px] text-gray-600">首次翻译由大模型分段生成，可能需要十几秒到一分钟，请稍候</span>
                   </div>
                 ) : changelogZh ? (
                   <>

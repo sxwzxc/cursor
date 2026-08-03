@@ -521,15 +521,27 @@ async function translateToZh(text, kind = 'changelog') {
 //
 // A single LLM call with the whole changelog (~8 KB) is unreliable on the
 // Makers gateway: long inputs / outputs can trip generation limits or time
-// out mid-response (observed as repeated translation failures). So long texts
-// are split into small sections, each translated by its own request with
-// bounded concurrency and per-section retries. Sections that still fail keep
-// their original English text (partial success) instead of failing the whole
-// changelog.
+// out mid-response (observed as repeated translation failures), and each
+// section call takes ~8-10s. EdgeOne kills the function process at ~30s
+// (504 CLOUD_FUNCTION_INVOCATION_TIMEOUT), so NO request can afford to wait
+// on the LLM inline. The strategy:
+//   1. Long texts are split into small sections (date headers, else ~1.5 KB
+//      paragraph chunks).
+//   2. Every lang=zh request kicks off a BACKGROUND pass (fire-and-forget)
+//      that translates the still-missing sections concurrently, persisting
+//      each completed section immediately.
+//   3. Persisted sections carry their own source hash, so the next pass
+//      resumes where the previous one stopped — progress accumulates across
+//      requests even if the process is recycled right after a response.
+//   4. The client polls; the assembled translation grows from 'partial' to
+//      'done' as passes advance.
 const SECTION_CHAR_LIMIT = 1500;   // max chars per section for a long text
 const SECTION_CONCURRENCY = 2;     // parallel LLM calls at once
 const SECTION_MAX_RETRIES = 2;     // per-section attempts (incl. the first)
-const SECTION_BUDGET_MS = 20000;   // hard cap for the whole sectioned run
+const SECTION_BUDGET_MS = 18000;   // per-pass cap (keeps even the background
+                                   // work from overlapping too much)
+const PASS_THROTTLE_MS = 8000;     // min gap between background passes
+                                   // (avoids piling up concurrent LLM calls)
 
 // Split at changelog date headers like "Jul 29, 2026 · Changelog" (or
 // "3.11 Jul 10, 2026 · Changelog"). The header line stays with its section.
@@ -663,40 +675,99 @@ async function getCachedTranslation(sourceHash, zhBlobKey) {
   return zh;
 }
 
-// Translate the given source text and persist the result. On success returns
-// { zh: <stored translation object> }; on failure returns
-// { zh: null, error: { reason, detail } }. `zhBlobKey` selects the cache to
-// write; `kind` tunes the LLM system prompt (see translateToZh).
-async function buildAndStoreTranslation(source, zhBlobKey, kind) {
-  if (!llmConfigured()) {
-    console.log('[translate] skipped: llm not configured', { zhBlobKey });
-    return { zh: null, error: { reason: 'not_configured', detail: null } };
+// One background translation pass over `source.text`. Translates the
+// sections that are still missing (resuming from the per-section hashes
+// already persisted in `zhBlobKey`), and rewrites the assembled blob after
+// every section completes so partial progress survives process recycling.
+// Fire-and-forget: never throws. `kind` tunes the LLM system prompt.
+async function runTranslationPass(source, kind, zhBlobKey) {
+  try {
+    if (!llmConfigured()) {
+      console.log('[translate] pass skipped: llm not configured', { zhBlobKey });
+      return;
+    }
+    const startedAt = Date.now();
+    let sections = splitChangelogSections(source.text);
+    if (sections.length <= 1) sections = splitLongText(source.text);
+    const srcHash = sections.map((s) => hashText(s));
+    const store = getStoreInstance();
+
+    // Load sections already completed for the same source.
+    let existing = null;
+    try { existing = await store.get(zhBlobKey, { type: 'json' }); } catch (_) {}
+    const doneMap = new Map(); // section number -> zh text
+    if (existing && Array.isArray(existing.sections)) {
+      for (const sec of existing.sections) {
+        const idx = (sec.num || 0) - 1;
+        if (idx >= 0 && idx < srcHash.length && sec.sourceHash === srcHash[idx] && typeof sec.text === 'string') {
+          doneMap.set(sec.num, sec.text);
+        }
+      }
+    }
+
+    // Reassemble + persist the current progress.
+    const persist = async () => {
+      const doneList = [];
+      const partialSections = [];
+      sections.forEach((_, i) => {
+        const num = i + 1;
+        if (doneMap.has(num)) doneList.push({ num, sourceHash: srcHash[i], text: doneMap.get(num) });
+        else partialSections.push(num);
+      });
+      doneList.sort((a, b) => a.num - b.num);
+      const zhData = {
+        text: doneList.map((s) => s.text).join('\n\n'),
+        sourceUrl: source.sourceUrl,
+        fetchedAt: source.fetchedAt,
+        translatedAt: new Date().toISOString(),
+        hash: source.hash,
+        translationStatus: partialSections.length === 0 ? 'done' : (doneList.length ? 'partial' : 'pending'),
+        partialSections,
+        sections: doneList,
+      };
+      await store.setJSON(zhBlobKey, zhData);
+      return zhData;
+    };
+
+    let next = 0;
+    const worker = async () => {
+      while (true) {
+        if (Date.now() - startedAt > SECTION_BUDGET_MS) break;
+        const idx = next++;
+        if (idx >= sections.length) break;
+        const num = idx + 1;
+        if (doneMap.has(num)) continue;
+        let ok = false;
+        for (let attempt = 0; attempt < SECTION_MAX_RETRIES; attempt++) {
+          if (Date.now() - startedAt > SECTION_BUDGET_MS) break;
+          const result = await translateToZh(sections[idx], kind);
+          if (result.ok) {
+            doneMap.set(num, result.translation);
+            await persist(); // checkpoint — survives process recycling
+            ok = true;
+            break;
+          }
+          await sleep(500 * (attempt + 1));
+        }
+        if (!ok && doneMap.has(num) === false) {
+          // Section kept in English; the next pass will try it again.
+          await persist();
+        }
+      }
+    };
+    await Promise.all(Array.from({ length: SECTION_CONCURRENCY }, () => worker()));
+
+    const finalZh = await persist();
+    console.log('[translate] pass done', {
+      zhBlobKey,
+      status: finalZh.translationStatus,
+      sectionsDone: finalZh.sections.length,
+      sectionsTotal: sections.length,
+      durationMs: Date.now() - startedAt,
+    });
+  } catch (e) {
+    console.log('[translate] pass failed', { zhBlobKey, error: describeFetchError(e) });
   }
-  console.log('[translate] calling LLM', { zhBlobKey, hash: source.hash, textLen: source.text.length });
-  const result = await translateText(source.text, kind);
-  if (!result.ok && !result.partial) {
-    console.log('[translate] failed', { zhBlobKey, reason: result.reason, detail: result.detail });
-    return { zh: null, error: { reason: result.reason || 'unknown', detail: result.detail || null } };
-  }
-  console.log('[translate] success', {
-    zhBlobKey,
-    translationLen: result.translation.length,
-    partial: result.partial,
-    failedSections: result.failedSections,
-    durationMs: result.durationMs,
-  });
-  const zhData = {
-    text: result.translation,
-    sourceUrl: source.sourceUrl,
-    fetchedAt: source.fetchedAt,
-    translatedAt: new Date().toISOString(),
-    hash: source.hash,
-    translationStatus: result.partial ? 'partial' : 'done',
-    partialSections: result.partial ? result.failedSections : undefined,
-  };
-  const store = getStoreInstance();
-  await store.setJSON(zhBlobKey, zhData);
-  return { zh: zhData, error: null };
 }
 
 // ---------- Koa setup ----------
@@ -1632,26 +1703,16 @@ async function fetchAndCacheChangelog() {
   }
 
   // Mark pending, persist the source first so a crash mid-translation still
-  // leaves the original changelog readable, then attempt the LLM in the
-  // background (best-effort — the process may be recycled right after the
-  // response, so the on-demand/cron paths remain the reliable ones).
+  // leaves the original changelog readable, then kick off a background pass
+  // (best-effort — the process may be recycled right after the response, so
+  // the resumable on-demand passes from /api/changelog?lang=zh are the
+  // reliable mechanism).
   changelogData.translationStatus = 'pending';
   changelogData.translatedAt = null;
+  changelogData.passStartedAt = new Date().toISOString();
   await store.setJSON('changelog/cached', changelogData);
 
-  buildAndStoreTranslation(changelogData, 'changelog/cached_zh', 'changelog')
-    .then((res) => {
-      if (res.zh) {
-        changelogData.translationStatus = res.zh.translationStatus;
-        changelogData.translatedAt = res.zh.translatedAt;
-        changelogData.lastError = undefined;
-      } else {
-        changelogData.translationStatus = 'failed';
-        changelogData.lastError = res.error.detail || res.error.reason;
-      }
-      return store.setJSON('changelog/cached', changelogData);
-    })
-    .catch((e) => console.log('[translate] background failed', { zhBlobKey: 'changelog/cached_zh', error: describeFetchError(e) }));
+  runTranslationPass(changelogData, 'changelog', 'changelog/cached_zh');
   return changelogData;
 }
 
@@ -1682,45 +1743,36 @@ router.get('/api/changelog', async (ctx) => {
     }
 
     if (source && source.hash) {
-      // 1. Reuse a matching cached translation.
-      let zh = await getCachedTranslation(source.hash, 'changelog/cached_zh');
-      // 2. If the LLM is configured but the translation is missing/failed,
-      //    try to produce it on demand so the user's first click still works.
-      //    Sectioned translation keeps this well under the function cap.
-      //    (When another request is already translating — status 'pending' —
-      //    skip the inline attempt and let the client poll instead.)
-      if (!zh && llmConfigured() && source.translationStatus !== 'pending') {
-        const res = await buildAndStoreTranslation(source, 'changelog/cached_zh', 'changelog');
-        if (res.zh) {
-          zh = res.zh;
-          source.translationStatus = res.zh.translationStatus;
-          source.translatedAt = res.zh.translatedAt;
-          source.lastError = undefined;
-        } else {
-          source.translationStatus = 'failed';
-          source.lastError = res.error.detail || res.error.reason;
-        }
-        try { await store.setJSON('changelog/cached', source); } catch (_) {}
-      }
+      // 1. Reuse a matching cached translation (may be 'partial' — some
+      //    sections still in English while the background pass keeps going).
+      const zh = await getCachedTranslation(source.hash, 'changelog/cached_zh');
       if (zh) {
         ctx.set('Cache-Control', 'no-store');
         ctx.body = { changelog: zh, durationMs: Date.now() - startedAt };
         return;
       }
-      // No translation available right now. Report a precise status so the
-      // client can poll ('pending') or show the failure reason ('failed').
-      const status = source.translationStatus || (llmConfigured() ? 'pending' : 'none');
-      const lastError = source.lastError || null;
+      // 2. No usable translation. NEVER wait on the LLM here — EdgeOne kills
+      //    the process at ~30s, and a sectioned translation of the full
+      //    changelog needs several times that (gateway takes ~8-10s per
+      //    section). Instead kick off a background pass (throttled so polling
+      //    clients don't pile up concurrent LLM calls) and tell the client
+      //    to poll. Each pass resumes from sections already persisted, so
+      //    progress accumulates across requests/processes.
+      if (llmConfigured()) {
+        const lastPass = source.passStartedAt ? Date.parse(source.passStartedAt) : 0;
+        if (!Number.isFinite(lastPass) || Date.now() - lastPass > PASS_THROTTLE_MS) {
+          source.passStartedAt = new Date().toISOString();
+          try { await store.setJSON('changelog/cached', source); } catch (_) {}
+          runTranslationPass(source, 'changelog', 'changelog/cached_zh');
+        }
+      }
       ctx.status = 404;
       ctx.body = {
         error: 'translation_unavailable',
-        translationStatus: status,
-        reason: lastError,
-        detail: status === 'pending'
-          ? 'Translation is being generated. Try again in a few seconds.'
-          : status === 'failed'
-            ? `Translation failed${lastError ? `: ${lastError}` : ''}. Try the original text and switch back later.`
-            : 'EdgeOne Makers AI Gateway key is not configured (apikey).',
+        translationStatus: llmConfigured() ? 'pending' : 'none',
+        detail: llmConfigured()
+          ? 'Translation is being generated in the background. Try again in a few seconds.'
+          : 'EdgeOne Makers AI Gateway key is not configured (apikey).',
         durationMs: Date.now() - startedAt,
       };
       return;
@@ -1765,6 +1817,20 @@ router.get('/api/changelog', async (ctx) => {
       ctx.body = { error: 'fetch_changelog_failed', detail: describeFetchError(e), durationMs: Date.now() - startedAt };
       return;
     }
+  }
+
+  // Sync the translation badge/status: the source blob's translationStatus is
+  // set to 'pending' when the content changes, but the authoritative state
+  // lives in the zh blob (per-section progress). Reflect it here so the
+  // frontend badge + prefetch stay accurate.
+  if (changelog && changelog.hash) {
+    try {
+      const zh = await getCachedTranslation(changelog.hash, 'changelog/cached_zh');
+      if (zh) {
+        changelog.translationStatus = zh.translationStatus;
+        changelog.translatedAt = zh.translatedAt;
+      }
+    } catch (_) {}
   }
 
   ctx.set('Cache-Control', 'no-store');
