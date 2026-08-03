@@ -540,11 +540,11 @@ async function translateToZh(text, kind = 'changelog', timeoutMs) {
 const SECTION_CHAR_LIMIT = 1500;   // max chars per section for a long text
 const SECTION_CONCURRENCY = 2;     // parallel LLM calls at once
 const SECTION_MAX_RETRIES = 2;     // per-section attempts (incl. the first)
-const SECTION_BUDGET_MS = 14000;   // per-pass cap on LLM work. EdgeOne kills
+const SECTION_BUDGET_MS = 10000;   // per-pass cap on LLM work. EdgeOne kills
                                    // the function at ~30s; blob writes are
-                                   // slow (~1-2s each), so the pass persists
-                                   // once at the end and keeps LLM time tight.
-const SECTION_CALL_TIMEOUT_MS = 15000; // per-section gateway timeout
+                                   // slow (~1-2s each) and the pass persists
+                                   // once at the end, so keep LLM time tight.
+const SECTION_CALL_TIMEOUT_MS = 12000; // per-section gateway timeout
 const PASS_THROTTLE_MS = 8000;     // min gap between translation passes
                                    // (avoids piling up concurrent LLM calls
                                    // from multiple clients/polls)
