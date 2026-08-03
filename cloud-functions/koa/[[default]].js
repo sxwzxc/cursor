@@ -442,7 +442,9 @@ function hashText(text) {
 // { ok: false, reason } on failure. `kind` ("changelog" | "models") only
 // tunes the first line of the system prompt; the structural rules are shared
 // because both sources are technical docs with tables/URLs/numbers.
-async function translateToZh(text, kind = 'changelog') {
+// `timeoutMs` overrides the configured LLM timeout (used by section passes,
+// which must stay well under EdgeOne's ~30s function cap).
+async function translateToZh(text, kind = 'changelog', timeoutMs) {
   const cfg = getLLMConfig();
   if (!llmConfigured()) {
     return { ok: false, reason: 'not_configured' };
@@ -491,7 +493,7 @@ async function translateToZh(text, kind = 'changelog') {
         max_tokens: 4096,
         stream: false,
       }),
-    }, cfg.timeoutMs);
+    }, timeoutMs && timeoutMs > 0 ? timeoutMs : cfg.timeoutMs);
   } catch (e) {
     return { ok: false, reason: 'fetch_failed', detail: describeFetchError(e) };
   }
@@ -538,10 +540,11 @@ async function translateToZh(text, kind = 'changelog') {
 const SECTION_CHAR_LIMIT = 1500;   // max chars per section for a long text
 const SECTION_CONCURRENCY = 2;     // parallel LLM calls at once
 const SECTION_MAX_RETRIES = 2;     // per-section attempts (incl. the first)
-const SECTION_BUDGET_MS = 16000;   // per-pass cap. EdgeOne kills the function
-                                   // at ~30s and in-flight LLM calls can run
-                                   // ~10s past the budget, so 16s leaves a
-                                   // safe margin for the response.
+const SECTION_BUDGET_MS = 14000;   // per-pass cap on LLM work. EdgeOne kills
+                                   // the function at ~30s; blob writes are
+                                   // slow (~1-2s each), so the pass persists
+                                   // once at the end and keeps LLM time tight.
+const SECTION_CALL_TIMEOUT_MS = 15000; // per-section gateway timeout
 const PASS_THROTTLE_MS = 8000;     // min gap between translation passes
                                    // (avoids piling up concurrent LLM calls
                                    // from multiple clients/polls)
@@ -711,8 +714,11 @@ async function runTranslationPass(source, kind, zhBlobKey) {
       }
     }
 
-    // Reassemble + persist the current progress.
-    const persist = async () => {
+    // Reassemble the blob from current progress. NOTE: persisted ONCE per
+    // pass (after the LLM work), not per section — blob writes are slow
+    // (~1-2s each) and EdgeOne's function cap is ~30s, so many writes would
+    // blow the budget.
+    const buildData = () => {
       const doneList = [];
       const partialSections = [];
       sections.forEach((_, i) => {
@@ -721,7 +727,7 @@ async function runTranslationPass(source, kind, zhBlobKey) {
         else partialSections.push(num);
       });
       doneList.sort((a, b) => a.num - b.num);
-      const zhData = {
+      return {
         // Sections that failed all attempts keep their original English text
         // so the assembled document stays complete (dates never jump).
         text: sections.map((s, i) => (doneMap.has(i + 1) ? doneMap.get(i + 1) : s)).join('\n\n'),
@@ -733,8 +739,6 @@ async function runTranslationPass(source, kind, zhBlobKey) {
         partialSections,
         sections: doneList,
       };
-      await store.setJSON(zhBlobKey, zhData);
-      return zhData;
     };
 
     let next = 0;
@@ -745,31 +749,24 @@ async function runTranslationPass(source, kind, zhBlobKey) {
         if (idx >= sections.length) break;
         const num = idx + 1;
         if (doneMap.has(num)) continue;
-        let ok = false;
         for (let attempt = 0; attempt < SECTION_MAX_RETRIES; attempt++) {
           if (Date.now() - startedAt > SECTION_BUDGET_MS) break;
-          const result = await translateToZh(sections[idx], kind);
+          const result = await translateToZh(sections[idx], kind, SECTION_CALL_TIMEOUT_MS);
           if (result.ok) {
             doneMap.set(num, result.translation);
-            await persist(); // checkpoint — survives process recycling
-            ok = true;
             break;
           }
           await sleep(500 * (attempt + 1));
-        }
-        if (!ok && doneMap.has(num) === false) {
-          // Section kept in English; the next pass will try it again.
-          await persist();
         }
       }
     };
     await Promise.all(Array.from({ length: SECTION_CONCURRENCY }, () => worker()));
 
-    const finalZh = await persist();
+    await store.setJSON(zhBlobKey, buildData());
     console.log('[translate] pass done', {
       zhBlobKey,
-      status: finalZh.translationStatus,
-      sectionsDone: finalZh.sections.length,
+      status: buildData().translationStatus,
+      sectionsDone: doneMap.size,
       sectionsTotal: sections.length,
       durationMs: Date.now() - startedAt,
     });

@@ -418,7 +418,7 @@ export default function Home() {
     try {
       let lastData: { error?: string; translationStatus?: string; detail?: string; changelog?: ChangelogData } | null = null;
       let gotAny = false;
-      for (let attempt = 0; attempt < 30; attempt++) {
+      for (let attempt = 0; attempt < 40; attempt++) {
         const resp = await fetch("/koa/api/changelog?lang=zh");
         const data = await resp.json();
         lastData = data;
