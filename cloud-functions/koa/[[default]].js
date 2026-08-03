@@ -294,6 +294,46 @@ async function downloadSingleChunk(platform, url, index, totalSize, chunkSize) {
   return { index, start, end, size: buf.byteLength };
 }
 
+// Download up to `count` missing chunks CONCURRENTLY within one function
+// invocation, so a single /api/update-step call advances the download several
+// chunks instead of one. `skip` (a Set of chunk indexes) excludes chunks that
+// already failed earlier in the same call — we don't retry them within one
+// invocation, the caller's next call picks them up again.
+//
+// Every successful chunk is committed to meta.chunksDone in a single write at
+// the end, keeping the meta consistent even under concurrent batch calls.
+// Returns { done, failed, remaining } — `remaining` is how many chunks are
+// still missing (excluding skipped ones), so callers know when to stop.
+async function downloadChunksInParallel(platform, meta, count, skip) {
+  const doneSet = new Set(meta.chunksDone || []);
+  const missing = [];
+  for (let i = 0; i < meta.chunkCount; i++) {
+    if (doneSet.has(i)) continue;
+    if (skip && skip.has(i)) continue;
+    missing.push(i);
+  }
+  const picked = missing.slice(0, Math.max(1, count || 1));
+  if (picked.length === 0) return { done: [], failed: [], remaining: 0 };
+
+  const results = await Promise.allSettled(
+    picked.map((idx) => downloadSingleChunk(platform, meta.sourceUrl, idx, meta.fileSize, meta.chunkSize)),
+  );
+  const done = [];
+  const failed = [];
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') {
+      done.push(picked[i]);
+    } else {
+      failed.push({ index: picked[i], error: describeFetchError(r.reason) });
+    }
+  });
+  for (const idx of done) {
+    if (!meta.chunksDone.includes(idx)) meta.chunksDone.push(idx);
+  }
+  await saveCachedMeta(platform, meta);
+  return { done, failed, remaining: missing.length - picked.length };
+}
+
 // Sum the actual bytes covered by chunksDone (the last chunk is shorter).
 function sumBytesDone(meta) {
   if (!meta || !meta.chunksDone || !meta.chunkCount) return 0;
@@ -444,6 +484,11 @@ async function translateToZh(text, kind = 'changelog') {
           { role: 'user', content: payload },
         ],
         temperature: 0.2,
+        // Cap the output so long inputs can't produce a response that the
+        // gateway rejects or that times out mid-generation. Long changelogs
+        // are split into sections (see translateText), so each call only
+        // needs a modest output budget.
+        max_tokens: 4096,
         stream: false,
       }),
     }, cfg.timeoutMs);
@@ -472,6 +517,137 @@ async function translateToZh(text, kind = 'changelog') {
   return { ok: true, translation };
 }
 
+// ---------- Sectioned translation ----------
+//
+// A single LLM call with the whole changelog (~8 KB) is unreliable on the
+// Makers gateway: long inputs / outputs can trip generation limits or time
+// out mid-response (observed as repeated translation failures). So long texts
+// are split into small sections, each translated by its own request with
+// bounded concurrency and per-section retries. Sections that still fail keep
+// their original English text (partial success) instead of failing the whole
+// changelog.
+const SECTION_CHAR_LIMIT = 1500;   // max chars per section for a long text
+const SECTION_CONCURRENCY = 2;     // parallel LLM calls at once
+const SECTION_MAX_RETRIES = 2;     // per-section attempts (incl. the first)
+const SECTION_BUDGET_MS = 20000;   // hard cap for the whole sectioned run
+
+// Split at changelog date headers like "Jul 29, 2026 · Changelog" (or
+// "3.11 Jul 10, 2026 · Changelog"). The header line stays with its section.
+function splitChangelogSections(text) {
+  const dateRe = /^(\d+(?:\.\d+)*\s*)?[A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}/i;
+  const lines = text.split('\n');
+  const sections = [];
+  let current = { header: '', lines: [] };
+  for (const line of lines) {
+    if (dateRe.test(line.trim())) {
+      current = { header: line, lines: [] };
+      sections.push(current);
+    } else {
+      current.lines.push(line);
+    }
+  }
+  if (sections.length === 0 && current.lines.length) sections.push(current);
+  return sections
+    .map((s) => {
+      const body = s.lines.join('\n').trim();
+      if (!s.header && !body) return null;
+      return [s.header, body].filter(Boolean).join('\n');
+    })
+    .filter(Boolean);
+}
+
+// Split long text that has no date headers into ~SECTION_CHAR_LIMIT pieces,
+// preferring paragraph boundaries so lines/tables aren't cut mid-row.
+function splitLongText(text) {
+  const paragraphs = text.split(/\n{2,}/);
+  const parts = [];
+  let current = '';
+  for (const p of paragraphs) {
+    const candidate = current ? `${current}\n\n${p}` : p;
+    if (current && candidate.length > SECTION_CHAR_LIMIT) {
+      parts.push(current);
+      current = p;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) parts.push(current);
+  return parts.length > 0 ? parts : [text];
+}
+
+// Translate `text` with the sectioned strategy described above. Short texts
+// (<= 2500 chars) go through a single call with a few retries. Returns
+// { ok, translation, partial, failedSections, durationMs, reason, detail }.
+async function translateText(text, kind = 'changelog') {
+  const startedAt = Date.now();
+  const budget = SECTION_BUDGET_MS;
+
+  if (text.length <= 2500) {
+    let last = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (Date.now() - startedAt > budget) break;
+      const result = await translateToZh(text, kind);
+      if (result.ok) {
+        return { ok: true, translation: result.translation, partial: false, failedSections: [], durationMs: Date.now() - startedAt };
+      }
+      last = result;
+      await sleep(500 * (attempt + 1));
+    }
+    return {
+      ok: false,
+      reason: last ? last.reason : 'timeout',
+      detail: last ? last.detail : null,
+      partial: false,
+      failedSections: [],
+      durationMs: Date.now() - startedAt,
+    };
+  }
+
+  let sections = splitChangelogSections(text);
+  if (sections.length <= 1) sections = splitLongText(text);
+
+  const results = new Array(sections.length).fill(null);
+  const failedSections = [];
+  let next = 0;
+
+  const worker = async () => {
+    while (true) {
+      if (Date.now() - startedAt > budget) break;
+      const idx = next++;
+      if (idx >= sections.length) break;
+      let ok = false;
+      let last = null;
+      for (let attempt = 0; attempt < SECTION_MAX_RETRIES; attempt++) {
+        if (Date.now() - startedAt > budget) break;
+        const result = await translateToZh(sections[idx], kind);
+        if (result.ok) {
+          results[idx] = result.translation;
+          ok = true;
+          break;
+        }
+        last = result;
+        await sleep(500 * (attempt + 1));
+      }
+      if (!ok) {
+        failedSections.push(idx);
+        // Keep the original text so the content stays readable.
+        results[idx] = sections[idx];
+      }
+    }
+  };
+
+  await Promise.all(Array.from({ length: SECTION_CONCURRENCY }, () => worker()));
+
+  const translation = results.join('\n\n');
+  return {
+    ok: failedSections.length === 0,
+    translation,
+    partial: failedSections.length > 0,
+    failedSections: failedSections.map((i) => i + 1),
+    durationMs: Date.now() - startedAt,
+  };
+}
+
 // Read the cached Chinese translation, but only trust it if its hash matches
 // the current source hash (otherwise the source changed and the translation
 // is stale). Returns null if no usable translation exists. `zhBlobKey`
@@ -487,32 +663,40 @@ async function getCachedTranslation(sourceHash, zhBlobKey) {
   return zh;
 }
 
-// Translate the given source text and persist the result. Returns the stored
-// translation object on success, or null on failure. `zhBlobKey` selects the
-// cache to write; `kind` tunes the LLM system prompt (see translateToZh).
+// Translate the given source text and persist the result. On success returns
+// { zh: <stored translation object> }; on failure returns
+// { zh: null, error: { reason, detail } }. `zhBlobKey` selects the cache to
+// write; `kind` tunes the LLM system prompt (see translateToZh).
 async function buildAndStoreTranslation(source, zhBlobKey, kind) {
   if (!llmConfigured()) {
     console.log('[translate] skipped: llm not configured', { zhBlobKey });
-    return null;
+    return { zh: null, error: { reason: 'not_configured', detail: null } };
   }
   console.log('[translate] calling LLM', { zhBlobKey, hash: source.hash, textLen: source.text.length });
-  const result = await translateToZh(source.text, kind);
-  if (!result.ok) {
+  const result = await translateText(source.text, kind);
+  if (!result.ok && !result.partial) {
     console.log('[translate] failed', { zhBlobKey, reason: result.reason, detail: result.detail });
-    return null;
+    return { zh: null, error: { reason: result.reason || 'unknown', detail: result.detail || null } };
   }
-  console.log('[translate] success', { zhBlobKey, translationLen: result.translation.length });
+  console.log('[translate] success', {
+    zhBlobKey,
+    translationLen: result.translation.length,
+    partial: result.partial,
+    failedSections: result.failedSections,
+    durationMs: result.durationMs,
+  });
   const zhData = {
     text: result.translation,
     sourceUrl: source.sourceUrl,
     fetchedAt: source.fetchedAt,
     translatedAt: new Date().toISOString(),
     hash: source.hash,
-    translationStatus: 'done',
+    translationStatus: result.partial ? 'partial' : 'done',
+    partialSections: result.partial ? result.failedSections : undefined,
   };
   const store = getStoreInstance();
   await store.setJSON(zhBlobKey, zhData);
-  return zhData;
+  return { zh: zhData, error: null };
 }
 
 // ---------- Koa setup ----------
@@ -553,7 +737,7 @@ router.get('/', (ctx) => {
       'GET /api/latest?platform=<id>': 'Fetch latest version info from cursor.com',
       'GET /api/status?platform=<id>': 'Return cached metadata (or null)',
       'GET /api/check?platform=<id>': 'Compare latest vs cached; returns needsUpdate flag',
-      'POST /api/update-step?platform=<id>&force=<bool>': 'Download ONE chunk per call (resumable, for frontend loop)',
+      'POST /api/update-step?platform=<id>&force=<bool>&count=<n>': 'Download up to 4 chunks in parallel per call (resumable, for frontend loop)',
       'POST /api/auto-update?platform=<id>': 'Auto check + download within 25s budget (for cron). Loop until action=completed|skipped.',
       'GET /api/download-manifest?platform=<id>': 'Chunk manifest (use this + /api/download-chunk to fetch the installer)',
       'GET /api/download-chunk?platform=<id>&index=<n>': 'Fetch a single chunk (avoids the function response size cap)',
@@ -627,27 +811,39 @@ router.get('/api/debug-llm', async (ctx) => {
   };
 });
 
-// Debug endpoint — runs a real LLM translation call on a tiny test sentence
-// and returns the raw outcome (ok/fail, reason, detail). This lets us verify
-// end-to-end that the Makers gateway accepts our key, model and request shape
-// without depending on the cached changelog.
+// Debug endpoint — runs a real LLM translation and returns the raw outcome
+// (ok/fail, reason, detail). This lets us verify end-to-end that the Makers
+// gateway accepts our key, model and request shape without depending on the
+// cached changelog.
+//
+// Query params:
+//   text=<url-encoded>   custom input (default: a tiny test sentence). Use a
+//                        long text to reproduce/sectioned-test translation.
 router.get('/api/debug-translate', async (ctx) => {
   const cfg = getLLMConfig();
+  const input = typeof ctx.query.text === 'string' && ctx.query.text.trim()
+    ? ctx.query.text.slice(0, 24000)
+    : 'Bug fixes and performance improvements.';
   console.log('[debug-translate] start', {
     configured: llmConfigured(),
     baseUrl: cfg.baseUrl,
     model: cfg.model,
     keyLen: cfg.apiKey.length,
+    inputLen: input.length,
   });
-  const result = await translateToZh('Bug fixes and performance improvements.');
-  console.log('[debug-translate] result', { ok: result.ok, reason: result.reason, detail: result.detail });
+  const result = await translateText(input, 'changelog');
+  console.log('[debug-translate] result', { ok: result.ok, partial: result.partial, reason: result.reason, detail: result.detail, durationMs: result.durationMs });
   ctx.set('Cache-Control', 'no-store');
   ctx.body = {
-    input: 'Bug fixes and performance improvements.',
+    inputLen: input.length,
+    inputHead: input.slice(0, 120),
     ok: result.ok,
-    reason: result.reason,
-    detail: result.detail,
-    translation: result.translation ? result.translation.slice(0, 200) : undefined,
+    partial: result.partial,
+    reason: result.reason || undefined,
+    detail: result.detail || undefined,
+    failedSections: result.failedSections,
+    durationMs: result.durationMs,
+    translation: result.translation ? result.translation.slice(0, 300) : undefined,
   };
 });
 
@@ -786,9 +982,13 @@ router.get('/api/check', async (ctx) => {
   ctx.body = { latest, cached, needsUpdate, reason, warning, durationMs: Date.now() - startedAt };
 });
 
-// Per-step update — downloads ONE chunk per invocation. This is the endpoint
-// the frontend calls in a loop: it dodges the EdgeOne function execution-time
-// cap (~30s) and gives natural progress reporting.
+// Per-step update — downloads a BATCH of chunks (default 4, parallel) per
+// invocation. This is the endpoint the frontend calls in a loop: it dodges
+// the EdgeOne function execution-time cap (~30s) and gives natural progress
+// reporting. Each batch of 4 × 6 MB downloads in ~3-15s, well under the cap.
+//
+// Query params:
+//   count=<n>  chunks to download concurrently per call (default 4, max 8)
 //
 // State machine (persisted in meta/{platform}):
 //   - No meta, or meta.commit != latest.commit, or force:
@@ -796,9 +996,8 @@ router.get('/api/check', async (ctx) => {
 //       -> return action='started' (no chunk fetched yet this call)
 //   - meta.status === 'downloading' and !force:
 //       -> FAST PATH: skip the cursor.com HEAD re-check and go straight to
-//          the next missing chunk.
-//       -> find the smallest chunk index not in chunksDone
-//       -> download + store that one chunk
+//          the next missing chunks.
+//       -> download up to `count` missing chunks concurrently
 //       -> if all chunks done, flip status to 'ready' and set completedAt
 //       -> return action='chunk_done' | 'completed'
 //   - meta.status === 'ready' and meta.commit === latest.commit and !force:
@@ -806,6 +1005,7 @@ router.get('/api/check', async (ctx) => {
 router.post('/api/update-step', async (ctx) => {
   const platform = ctx.query.platform;
   const force = ctx.query.force === 'true' || ctx.query.force === '1';
+  const count = Math.min(Math.max(parseInt(ctx.query.count, 10) || 4, 1), 8);
   if (!isValidPlatform(platform)) {
     ctx.status = 400;
     ctx.body = { error: 'invalid_platform' };
@@ -818,7 +1018,7 @@ router.post('/api/update-step', async (ctx) => {
   let cached = await getCachedMeta(platform);
   if (!force && cached && cached.status === 'downloading' && cached.commit && cached.sourceUrl
       && cached.chunkSize === CHUNK_SIZE) {
-    const resumeResult = await resumeDownload(platform, cached, startedAt);
+    const resumeResult = await resumeDownload(platform, cached, startedAt, null, count);
     if (resumeResult.body) {
       ctx.body = resumeResult.body;
       return;
@@ -922,9 +1122,10 @@ router.post('/api/update-step', async (ctx) => {
   };
 });
 
-// Resume helper: downloads the next missing chunk for an in-progress download.
-// Returns either { body } (success) or { error } (failure).
-async function resumeDownload(platform, cached, startedAt, latest) {
+// Resume helper: downloads the next missing chunks (up to `count` in
+// parallel) for an in-progress download. Returns either { body } (success)
+// or { error } (failure).
+async function resumeDownload(platform, cached, startedAt, latest, count) {
   const chunksDoneSet = new Set(cached.chunksDone || []);
   let nextIndex = -1;
   for (let i = 0; i < cached.chunkCount; i++) {
@@ -953,9 +1154,9 @@ async function resumeDownload(platform, cached, startedAt, latest) {
     };
   }
 
-  let range;
+  let batch;
   try {
-    range = await downloadSingleChunk(platform, cached.sourceUrl, nextIndex, cached.fileSize, cached.chunkSize);
+    batch = await downloadChunksInParallel(platform, cached, count || 4);
   } catch (e) {
     // Return action='retry' (HTTP 200) so the frontend loops again.
     return {
@@ -977,7 +1178,27 @@ async function resumeDownload(platform, cached, startedAt, latest) {
     };
   }
 
-  cached.chunksDone.push(nextIndex);
+  if (batch.done.length === 0) {
+    const first = batch.failed[0];
+    return {
+      body: {
+        action: 'retry',
+        reason: 'chunk_download_failed',
+        detail: first ? first.error : 'chunk download failed',
+        latest: latest || metaToLatest(cached),
+        cached,
+        progress: {
+          chunksDone: cached.chunksDone.length,
+          chunksTotal: cached.chunkCount,
+          bytesDownloaded: sumBytesDone(cached),
+          bytesTotal: cached.fileSize,
+          chunkIndex: nextIndex,
+        },
+        durationMs: Date.now() - startedAt,
+      },
+    };
+  }
+
   const bytesDownloaded = sumBytesDone(cached);
 
   let action = 'chunk_done';
@@ -1000,9 +1221,7 @@ async function resumeDownload(platform, cached, startedAt, latest) {
         bytesDownloaded,
         bytesTotal: cached.fileSize,
         chunkIndex: nextIndex,
-        chunkSize: range.size,
-        chunkStart: range.start,
-        chunkEnd: range.end,
+        chunksDownloadedThisCall: batch.done.length,
       },
       durationMs: Date.now() - startedAt,
     },
@@ -1107,28 +1326,43 @@ router.post('/api/auto-update', async (ctx) => {
   }
 
   // ---- Phase 2: Download chunks within the time budget ----
-  const chunksDoneSet = new Set(cached.chunksDone || []);
+  // Chunks are downloaded in parallel batches (4 at a time) so each 25s call
+  // advances the download ~4× faster than one chunk at a time. Chunks that
+  // fail in this invocation are skipped (not retried) so the next batch can
+  // make progress on other chunks; they are picked up by the following call.
+  const BATCH_CONCURRENCY = 4;
   let chunksDownloadedThisCall = 0;
   let consecutiveFailures = 0;
   let lastError = null;
+  const failedThisCall = new Set();
 
-  for (let i = 0; i < cached.chunkCount; i++) {
-    if (Date.now() - startedAt > TIME_BUDGET_MS) break;
-    if (chunksDoneSet.has(i)) continue;
+  while (Date.now() - startedAt < TIME_BUDGET_MS) {
+    const doneSet = new Set(cached.chunksDone || []);
+    const missing = [];
+    for (let i = 0; i < cached.chunkCount; i++) {
+      if (!doneSet.has(i) && !failedThisCall.has(i)) missing.push(i);
+    }
+    if (missing.length === 0) break;
 
+    let batch;
     try {
-      await downloadSingleChunk(platform, cached.sourceUrl, i, cached.fileSize, cached.chunkSize);
-      cached.chunksDone.push(i);
-      chunksDoneSet.add(i);
-      chunksDownloadedThisCall++;
-      consecutiveFailures = 0;
-      await saveCachedMeta(platform, cached);
+      batch = await downloadChunksInParallel(platform, cached, BATCH_CONCURRENCY, failedThisCall);
     } catch (e) {
       lastError = e;
       consecutiveFailures++;
       if (consecutiveFailures >= 5) break;
       await sleep(1000);
+      continue;
     }
+    chunksDownloadedThisCall += batch.done.length;
+    if (batch.done.length > 0) consecutiveFailures = 0;
+    if (batch.failed.length > 0) {
+      lastError = new Error(batch.failed[0].error);
+      consecutiveFailures += batch.failed.length;
+      for (const f of batch.failed) failedThisCall.add(f.index);
+    }
+    if (consecutiveFailures >= 5) break;
+    if (batch.failed.length > 0) await sleep(1000);
   }
 
   // ---- Phase 3: Check if we're done ----
@@ -1376,9 +1610,12 @@ async function fetchAndCacheChangelog() {
   // Content is new (or first cache). Decide what to do about translation:
   //   - LLM not configured → translationStatus='none', move on.
   //   - A matching cached translation already exists → reuse it.
-  //   - Otherwise → synchronously call the LLM once; if it succeeds, mark
-  //     'done'; if it fails, mark 'failed' so the client can show the
-  //     "translation unavailable" state instead of looping forever.
+  //   - Otherwise → mark 'pending' and kick the LLM off in the background.
+  //     The response NEVER waits for the LLM: a slow/failed translation must
+  //     not stall the changelog fetch (a synchronous call can take 15-25s and
+  //     blow past EdgeOne's ~30s function execution cap, which is exactly the
+  //     "一直加载中/失败" symptom this fixes). The translation is finalised by
+  //     GET /api/changelog?lang=zh on demand or by the daily cron job.
   if (!llmConfigured()) {
     changelogData.translationStatus = 'none';
     changelogData.translatedAt = null;
@@ -1395,19 +1632,26 @@ async function fetchAndCacheChangelog() {
   }
 
   // Mark pending, persist the source first so a crash mid-translation still
-  // leaves the original changelog readable, then attempt the LLM call.
+  // leaves the original changelog readable, then attempt the LLM in the
+  // background (best-effort — the process may be recycled right after the
+  // response, so the on-demand/cron paths remain the reliable ones).
   changelogData.translationStatus = 'pending';
   changelogData.translatedAt = null;
   await store.setJSON('changelog/cached', changelogData);
 
-  const zh = await buildAndStoreTranslation(changelogData, 'changelog/cached_zh', 'changelog');
-  if (zh) {
-    changelogData.translationStatus = 'done';
-    changelogData.translatedAt = zh.translatedAt;
-  } else {
-    changelogData.translationStatus = 'failed';
-  }
-  await store.setJSON('changelog/cached', changelogData);
+  buildAndStoreTranslation(changelogData, 'changelog/cached_zh', 'changelog')
+    .then((res) => {
+      if (res.zh) {
+        changelogData.translationStatus = res.zh.translationStatus;
+        changelogData.translatedAt = res.zh.translatedAt;
+        changelogData.lastError = undefined;
+      } else {
+        changelogData.translationStatus = 'failed';
+        changelogData.lastError = res.error.detail || res.error.reason;
+      }
+      return store.setJSON('changelog/cached', changelogData);
+    })
+    .catch((e) => console.log('[translate] background failed', { zhBlobKey: 'changelog/cached_zh', error: describeFetchError(e) }));
   return changelogData;
 }
 
@@ -1442,27 +1686,41 @@ router.get('/api/changelog', async (ctx) => {
       let zh = await getCachedTranslation(source.hash, 'changelog/cached_zh');
       // 2. If the LLM is configured but the translation is missing/failed,
       //    try to produce it on demand so the user's first click still works.
+      //    Sectioned translation keeps this well under the function cap.
+      //    (When another request is already translating — status 'pending' —
+      //    skip the inline attempt and let the client poll instead.)
       if (!zh && llmConfigured() && source.translationStatus !== 'pending') {
-        zh = await buildAndStoreTranslation(source, 'changelog/cached_zh', 'changelog');
-        if (zh) {
-          source.translationStatus = 'done';
-          source.translatedAt = zh.translatedAt;
-          try { await store.setJSON('changelog/cached', source); } catch (_) {}
+        const res = await buildAndStoreTranslation(source, 'changelog/cached_zh', 'changelog');
+        if (res.zh) {
+          zh = res.zh;
+          source.translationStatus = res.zh.translationStatus;
+          source.translatedAt = res.zh.translatedAt;
+          source.lastError = undefined;
+        } else {
+          source.translationStatus = 'failed';
+          source.lastError = res.error.detail || res.error.reason;
         }
+        try { await store.setJSON('changelog/cached', source); } catch (_) {}
       }
       if (zh) {
         ctx.set('Cache-Control', 'no-store');
         ctx.body = { changelog: zh, durationMs: Date.now() - startedAt };
         return;
       }
-      // No translation available right now.
+      // No translation available right now. Report a precise status so the
+      // client can poll ('pending') or show the failure reason ('failed').
+      const status = source.translationStatus || (llmConfigured() ? 'pending' : 'none');
+      const lastError = source.lastError || null;
       ctx.status = 404;
       ctx.body = {
         error: 'translation_unavailable',
-        translationStatus: source.translationStatus || (llmConfigured() ? 'pending' : 'none'),
-        detail: llmConfigured()
-          ? 'Translation is not ready yet. Try the original text and switch back in a few seconds.'
-          : 'EdgeOne Makers AI Gateway key is not configured (AI_GATEWAY_API_KEY).',
+        translationStatus: status,
+        reason: lastError,
+        detail: status === 'pending'
+          ? 'Translation is being generated. Try again in a few seconds.'
+          : status === 'failed'
+            ? `Translation failed${lastError ? `: ${lastError}` : ''}. Try the original text and switch back later.`
+            : 'EdgeOne Makers AI Gateway key is not configured (apikey).',
         durationMs: Date.now() - startedAt,
       };
       return;

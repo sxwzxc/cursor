@@ -71,15 +71,15 @@ jobs:
       - name: Refresh changelog & pricing mirror
         # Force-refresh the docs mirror caches so they stay current without
         # relying on a user clicking the buttons. changelog diffs by hash
-        # and only calls the LLM when content changed; pricing just re-fetches
-        # the SSR text (no translation per the plan).
+        # (the LLM translation is kicked off in the background, NOT inline, so
+        # the response never blocks); pricing just re-fetches the SSR text
+        # (no translation per the plan).
         run: |
           set -euo pipefail
           for path in changelog models; do
             echo "=== Refresh /api/$path ==="
             # force=true bypasses the read-cache fast path and re-fetches
-            # cursor.com. The LLM translation runs inline if the hash changed,
-            # so allow up to 60s per call.
+            # cursor.com. The response no longer waits on the LLM.
             curl -sS -m 60 "https://cursor.sxwzxc.cn/koa/api/$path?force=true" \
               | python3 -c "
           import sys, json
@@ -96,3 +96,25 @@ jobs:
             print(f\"  parse error: {e}\")
           " || echo "  (request failed)"
           done
+
+      - name: Finalize changelog translation
+        # The force-refresh marks a changed changelog as 'pending' and leaves
+        # the LLM work to be triggered on demand. This step triggers the
+        # sectioned on-demand translation so the Chinese changelog is ready
+        # even if no user ever clicks the toggle. Idempotent: returns
+        # immediately when a translation for the current hash already exists.
+        run: |
+          echo "=== Finalize /api/changelog?lang=zh ==="
+          curl -sS -m 35 "https://cursor.sxwzxc.cn/koa/api/changelog?lang=zh" \
+            | python3 -c "
+          import sys, json
+          try:
+            d = json.load(sys.stdin)
+            if d.get('changelog'):
+              c = d['changelog']
+              print(f\"  translationStatus={c.get('translationStatus')} textLen={len(c.get('text',''))}\")
+            else:
+              print(f\"  not ready: status={d.get('translationStatus')} reason={d.get('reason')} detail={d.get('detail','')}\")
+          except Exception as e:
+            print(f\"  parse error: {e}\")
+          " || echo "  (request failed)"

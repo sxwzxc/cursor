@@ -67,8 +67,9 @@ interface ChangelogData {
   text: string;
   sourceUrl: string;
   fetchedAt: string;
-  translationStatus?: "none" | "pending" | "done" | "failed";
+  translationStatus?: "none" | "pending" | "done" | "partial" | "failed";
   translatedAt?: string;
+  partialSections?: number[];
 }
 
 interface ModelRow {
@@ -135,6 +136,7 @@ export default function Home() {
   const [changelogLoading, setChangelogLoading] = useState(false);
   const [changelogLang, setChangelogLang] = useState<"orig" | "zh">("orig");
   const [zhLoading, setZhLoading] = useState(false);
+  const [zhError, setZhError] = useState<string>("");
   const [showChangelog, setShowChangelog] = useState(false);
   const [models, setModels] = useState<ModelsData | null>(null);
   const [modelsLoading, setModelsLoading] = useState(false);
@@ -256,7 +258,54 @@ export default function Home() {
         chunks: { index: number; url: string; size: number }[];
       };
 
-      // 2. Try the File System Access API (Chromium) to stream straight to
+      // 2. Concurrent chunk fetcher. Chunks are downloaded by a pool of
+      // workers in parallel (browsers cap ~6 connections per host, so 4 is
+      // the sweet spot) while writes happen strictly in order. To bound
+      // memory we never buffer more than QUEUE_AHEAD chunks ahead of the
+      // writer. Any worker error aborts the whole download.
+      const CONCURRENCY = 4;
+      const QUEUE_AHEAD = 8;
+      const fetched = new Map<number, ArrayBuffer>();
+      let received = 0;
+      let fetchError: Error | null = null;
+      let nextToFetch = 0;
+      const reportProgress = (chunkIndex: number) => {
+        const speed = trackSpeed(received);
+        setDownloadProgress({ received, total: fileSize, fileName, chunkIndex, chunkTotal: chunks.length, speedBps: speed });
+        setElapsed(Date.now() - start);
+      };
+      const fetchWorker = async () => {
+        while (nextToFetch < chunks.length) {
+          if (fetchError) return;
+          if (fetched.size >= QUEUE_AHEAD) {
+            await new Promise((r) => setTimeout(r, 50));
+            continue;
+          }
+          const idx = nextToFetch++;
+          const chunk = chunks[idx];
+          try {
+            const r = await fetch(chunk.url);
+            if (!r.ok) throw new Error(`分片 ${idx} 下载失败: HTTP ${r.status}`);
+            const buf = await r.arrayBuffer();
+            if (fetchError) return;
+            fetched.set(idx, buf);
+            received += buf.byteLength;
+            reportProgress(idx + 1);
+          } catch (e) {
+            fetchError = e instanceof Error ? e : new Error(String(e));
+            return;
+          }
+        }
+      };
+      const waitForChunk = async (idx: number): Promise<ArrayBuffer> => {
+        while (!fetched.has(idx)) {
+          if (fetchError) throw fetchError;
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        return fetched.get(idx) as ArrayBuffer;
+      };
+
+      // 3. Try the File System Access API (Chromium) to stream straight to
       // disk without holding the full file in memory.
       const w = window as unknown as {
         showSaveFilePicker?: (opts: {
@@ -281,37 +330,35 @@ export default function Home() {
           throw e;
         }
         const writable = await (handle as unknown as { createWritable: () => Promise<FileSystemWritableFileStream> }).createWritable();
-        let received = 0;
-        for (const chunk of chunks) {
-          const r = await fetch(chunk.url);
-          if (!r.ok) throw new Error(`分片 ${chunk.index} 下载失败: HTTP ${r.status}`);
-          const buf = await r.arrayBuffer();
-          await writable.write(buf);
-          received += buf.byteLength;
-          const speed = trackSpeed(received);
-          setDownloadProgress({ received, total: fileSize, fileName, chunkIndex: chunk.index + 1, chunkTotal: chunks.length, speedBps: speed });
-          setElapsed(Date.now() - start);
+        const workers = Array.from({ length: CONCURRENCY }, () => fetchWorker());
+        try {
+          for (const chunk of chunks) {
+            const buf = await waitForChunk(chunk.index);
+            await writable.write(buf);
+            fetched.delete(chunk.index);
+          }
+          await Promise.all(workers);
+          await writable.close();
+        } catch (e) {
+          try { await writable.abort(); } catch (_) {}
+          throw e;
         }
-        await writable.close();
         const speed = trackSpeed(fileSize);
         setDownloadProgress({ received: fileSize, total: fileSize, fileName, chunkIndex: chunks.length, chunkTotal: chunks.length, speedBps: speed });
         return;
       }
 
-      // 3. Fallback: fetch all chunks into memory, then trigger a Blob download.
-      const parts: BlobPart[] = [];
-      let received = 0;
-      for (const chunk of chunks) {
-        const r = await fetch(chunk.url);
-        if (!r.ok) throw new Error(`分片 ${chunk.index} 下载失败: HTTP ${r.status}`);
-        const buf = await r.arrayBuffer();
-        parts.push(buf);
-        received += buf.byteLength;
-        const speed = trackSpeed(received);
-        setDownloadProgress({ received, total: fileSize, fileName, chunkIndex: chunk.index + 1, chunkTotal: chunks.length, speedBps: speed });
-        setElapsed(Date.now() - start);
-      }
-      const blob = new Blob(parts, { type: "application/octet-stream" });
+      // 4. Fallback: fetch all chunks (concurrently) into memory, then
+      // trigger a Blob download.
+      const workers = Array.from({ length: CONCURRENCY }, () => fetchWorker());
+      await Promise.all(workers);
+      if (fetchError) throw fetchError;
+      const ordered: BlobPart[] = chunks.map((chunk) => {
+        const buf = fetched.get(chunk.index);
+        if (!buf) throw new Error(`分片 ${chunk.index} 缺失`);
+        return buf;
+      });
+      const blob = new Blob(ordered, { type: "application/octet-stream" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -357,26 +404,47 @@ export default function Home() {
     }
   };
 
-  // Lazily fetch the Chinese translation when the user toggles to it.
+  // Lazily fetch the Chinese translation when the user toggles to it. The
+  // server translates on demand, which takes several seconds the first time,
+  // and another request (background kick-off / cron) may already be working
+  // on it. So we poll: 'pending' keeps retrying, 'failed' surfaces the
+  // server's reason instead of spinning forever.
   const handleSwitchToZh = async () => {
     setChangelogLang("zh");
+    setZhError("");
     if (changelogZh) return;
     setZhLoading(true);
     try {
-      const resp = await fetch("/koa/api/changelog?lang=zh");
-      const data = await resp.json();
-      if (!resp.ok) throw new Error(data.detail || data.error || "翻译获取失败");
-      setChangelogZh(data.changelog);
-      // Keep the original's translationStatus in sync so the badge updates.
-      if (changelog && data.changelog) {
-        setChangelog({
-          ...changelog,
-          translationStatus: data.changelog.translationStatus,
-          translatedAt: data.changelog.translatedAt,
-        });
+      let lastData: { error?: string; translationStatus?: string; detail?: string; changelog?: ChangelogData } | null = null;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        const resp = await fetch("/koa/api/changelog?lang=zh");
+        const data = await resp.json();
+        lastData = data;
+        if (resp.ok && data.changelog) {
+          setChangelogZh(data.changelog);
+          // Keep the original's translationStatus in sync so the badge updates.
+          if (changelog && data.changelog) {
+            setChangelog({
+              ...changelog,
+              translationStatus: data.changelog.translationStatus,
+              translatedAt: data.changelog.translatedAt,
+            });
+          }
+          return;
+        }
+        // Definite failure states — stop polling and tell the user why.
+        if (data.translationStatus === "failed" || data.translationStatus === "none") {
+          throw new Error(data.detail || data.error || "翻译获取失败");
+        }
+        // 'pending' (or missing status) — the translation is being generated;
+        // wait briefly and check again.
+        await new Promise((r) => setTimeout(r, 2000));
       }
+      throw new Error(lastData?.detail || "翻译生成超时，请稍后重试");
     } catch (e) {
-      setError(e instanceof Error ? e.message : "翻译获取失败");
+      const msg = e instanceof Error ? e.message : "翻译获取失败";
+      setZhError(msg);
+      setError(msg);
     } finally {
       setZhLoading(false);
     }
@@ -753,7 +821,7 @@ GET  /koa/api/platforms        平台列表
 GET  /koa/api/latest?platform=  官方最新版信息
 GET  /koa/api/status?platform=  镜像站缓存信息
 GET  /koa/api/check?platform=   对比最新版与缓存
-POST /koa/api/update-step?platform=  下载一个分片（前端循环调用）
+POST /koa/api/update-step?platform=&count=  并行下载分片（默认 4 个，前端循环调用）
 POST /koa/api/auto-update?platform=   自动检查+下载（定时任务用）
 GET  /koa/api/download-manifest?platform=  分片清单
 GET  /koa/api/download-chunk?platform=&index=  下载单个分片
@@ -799,7 +867,7 @@ GET  /koa/api/debug-translate          (调试) 测试一次 LLM 翻译调用`}
                 {/* Language toggle */}
                 <div className="flex items-center rounded-md border border-white/10 bg-white/[0.03] p-0.5">
                   <button
-                    onClick={() => setChangelogLang("orig")}
+                    onClick={() => { setChangelogLang("orig"); setZhError(""); }}
                     className={`flex items-center gap-1 rounded px-2.5 py-1 text-[11px] transition-all ${
                       changelogLang === "orig"
                         ? "bg-[#1c66e5] text-white"
@@ -857,14 +925,24 @@ GET  /koa/api/debug-translate          (调试) 测试一次 LLM 翻译调用`}
                   <div className="flex flex-col items-center justify-center py-12">
                     <Loader2 className="h-6 w-6 animate-spin text-[#1c66e5]" />
                     <span className="mt-3 text-sm text-gray-400">正在获取翻译…</span>
-                    <span className="mt-1 text-[11px] text-gray-600">首次翻译由大模型生成，可能需要数秒</span>
+                    <span className="mt-1 text-[11px] text-gray-600">首次翻译由大模型生成，可能需要数秒，请稍候</span>
                   </div>
                 ) : changelogZh ? (
-                  <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-gray-300">{changelogZh.text}</pre>
+                  <>
+                    {changelogZh.translationStatus === "partial" && (
+                      <div className="mb-3 flex items-start gap-2 rounded-md border border-yellow-800/40 bg-yellow-950/20 px-3 py-2">
+                        <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0 text-yellow-400" />
+                        <p className="text-[11px] leading-relaxed text-yellow-300/90">
+                          部分内容翻译失败，已保留英文原文。
+                        </p>
+                      </div>
+                    )}
+                    <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-gray-300">{changelogZh.text}</pre>
+                  </>
                 ) : (
                   <div className="py-12 text-center">
                     <p className="text-sm text-gray-400">翻译暂不可用</p>
-                    <p className="mt-1 text-[11px] text-gray-600">服务端未配置翻译 LLM，请稍后再试或查看原文</p>
+                    <p className="mt-1 text-[11px] text-gray-600">{zhError || "服务端未配置翻译 LLM，请稍后再试或查看原文"}</p>
                   </div>
                 )
               ) : changelog ? (
