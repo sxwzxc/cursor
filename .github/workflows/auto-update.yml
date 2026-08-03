@@ -70,10 +70,10 @@ jobs:
 
       - name: Refresh changelog & pricing mirror
         # Force-refresh the docs mirror caches so they stay current without
-        # relying on a user clicking the buttons. changelog diffs by hash
-        # (the LLM translation is kicked off in the background, NOT inline, so
-        # the response never blocks); pricing just re-fetches the SSR text
-        # (no translation per the plan).
+        # relying on a user clicking the buttons. changelog diffs by hash and
+        # returns immediately (it never blocks on the LLM — EdgeOne kills
+        # functions at ~30s, and a full translation needs several passes);
+        # pricing just re-fetches the SSR text (no translation per the plan).
         run: |
           set -euo pipefail
           for path in changelog models; do
@@ -101,10 +101,10 @@ jobs:
         # The force-refresh marks a changed changelog as 'pending' and never
         # blocks on the LLM (EdgeOne kills functions at ~30s, far too short
         # to translate the whole changelog inline). Instead each lang=zh
-        # request kicks off a resumable background pass that translates a few
-        # sections and persists them, so we poll: every retry re-triggers a
-        # pass and picks up accumulated progress until the translation is
-        # 'done' (or we run out of attempts).
+        # request runs ONE bounded resumable pass inline — translating a few
+        # ~700-char sections and persisting them — so we poll: every retry
+        # advances the translation until it is 'done' (or we run out of
+        # attempts; the next scheduled run continues).
         run: |
           set -euo pipefail
           for i in $(seq 1 12); do
