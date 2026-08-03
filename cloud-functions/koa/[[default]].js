@@ -547,7 +547,7 @@ const SECTION_BUDGET_MS = 10000;   // per-pass cap on LLM work. EdgeOne kills
                                    // the function at ~30s; blob writes are
                                    // slow (~1-2s each) and the pass persists
                                    // once at the end, so keep LLM time tight.
-const SECTION_CALL_TIMEOUT_MS = 12000; // per-section gateway timeout
+const SECTION_CALL_TIMEOUT_MS = 15000; // per-section gateway timeout
 const PASS_THROTTLE_MS = 8000;     // min gap between translation passes
                                    // (avoids piling up concurrent LLM calls
                                    // from multiple clients/polls)
@@ -595,12 +595,36 @@ function splitChangelogSections(text) {
 }
 
 // Split long text that has no date headers into ~SECTION_CHAR_LIMIT pieces,
-// preferring paragraph boundaries so lines/tables aren't cut mid-row.
+// preferring paragraph boundaries so lines/tables aren't cut mid-row. A
+// single paragraph longer than the limit is hard-split at word boundaries so
+// no piece ever exceeds the limit (an oversized piece would blow the
+// per-call gateway timeout and never complete).
 function splitLongText(text) {
   const paragraphs = text.split(/\n{2,}/);
   const parts = [];
   let current = '';
+
+  const hardSplit = (s) => {
+    const words = s.split(' ');
+    let cur = '';
+    for (const w of words) {
+      const piece = cur ? `${cur} ${w}` : w;
+      if (cur && piece.length > SECTION_CHAR_LIMIT) {
+        parts.push(cur);
+        cur = w;
+      } else {
+        cur = piece;
+      }
+    }
+    if (cur) parts.push(cur);
+  };
+
   for (const p of paragraphs) {
+    if (p.length > SECTION_CHAR_LIMIT) {
+      if (current) { parts.push(current); current = ''; }
+      hardSplit(p);
+      continue;
+    }
     const candidate = current ? `${current}\n\n${p}` : p;
     if (current && candidate.length > SECTION_CHAR_LIMIT) {
       parts.push(current);
