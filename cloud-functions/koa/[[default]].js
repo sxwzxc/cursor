@@ -537,7 +537,10 @@ async function translateToZh(text, kind = 'changelog', timeoutMs) {
 //      requests even if the process is recycled right after a response.
 //   4. The client polls; the assembled translation grows from 'partial' to
 //      'done' as passes advance.
-const SECTION_CHAR_LIMIT = 1500;   // max chars per section for a long text
+const SECTION_CHAR_LIMIT = 700;    // max chars per section for a long text.
+                                   // The gateway takes ~5-8s per section call;
+                                   // bigger sections (up to 2.3 KB) exceed the
+                                   // 12s per-call timeout and never complete.
 const SECTION_CONCURRENCY = 2;     // parallel LLM calls at once
 const SECTION_MAX_RETRIES = 2;     // per-section attempts (incl. the first)
 const SECTION_BUDGET_MS = 10000;   // per-pass cap on LLM work. EdgeOne kills
@@ -548,6 +551,23 @@ const SECTION_CALL_TIMEOUT_MS = 12000; // per-section gateway timeout
 const PASS_THROTTLE_MS = 8000;     // min gap between translation passes
                                    // (avoids piling up concurrent LLM calls
                                    // from multiple clients/polls)
+
+// Build the translation work list: split at date headers first, then further
+// split any section longer than SECTION_CHAR_LIMIT at paragraph boundaries
+// (so even a big date section becomes several small, fast LLM calls).
+function splitSections(text) {
+  let sections = splitChangelogSections(text);
+  if (sections.length <= 1) sections = splitLongText(text);
+  const parts = [];
+  for (const s of sections) {
+    if (s.length <= SECTION_CHAR_LIMIT) {
+      parts.push(s);
+    } else {
+      parts.push(...splitLongText(s));
+    }
+  }
+  return parts;
+}
 
 // Split at changelog date headers like "Jul 29, 2026 · Changelog" (or
 // "3.11 Jul 10, 2026 · Changelog"). The header line stays with its section.
@@ -621,8 +641,7 @@ async function translateText(text, kind = 'changelog') {
     };
   }
 
-  let sections = splitChangelogSections(text);
-  if (sections.length <= 1) sections = splitLongText(text);
+  const sections = splitSections(text);
 
   const results = new Array(sections.length).fill(null);
   const failedSections = [];
@@ -696,8 +715,7 @@ async function runTranslationPass(source, kind, zhBlobKey) {
       return;
     }
     const startedAt = Date.now();
-    let sections = splitChangelogSections(source.text);
-    if (sections.length <= 1) sections = splitLongText(source.text);
+    const sections = splitSections(source.text);
     const srcHash = sections.map((s) => hashText(s));
     const store = getStoreInstance();
 
@@ -1753,11 +1771,7 @@ router.get('/api/changelog', async (ctx) => {
       //    English after repeated failures). Blobs written by older code
       //    (no `sections` array) or with gaps are NOT treated as final —
       //    the resumable pass below fills them in.
-      const sectionCount = (() => {
-        let s = splitChangelogSections(source.text);
-        if (s.length <= 1) s = splitLongText(source.text);
-        return s.length;
-      })();
+      const sectionCount = splitSections(source.text).length;
       const zh = await getCachedTranslation(source.hash, 'changelog/cached_zh');
       const blobComplete = zh && Array.isArray(zh.sections) && zh.sections.length >= sectionCount;
       if (blobComplete) {
