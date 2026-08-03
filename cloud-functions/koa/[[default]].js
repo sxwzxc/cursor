@@ -722,7 +722,9 @@ async function runTranslationPass(source, kind, zhBlobKey) {
       });
       doneList.sort((a, b) => a.num - b.num);
       const zhData = {
-        text: doneList.map((s) => s.text).join('\n\n'),
+        // Sections that failed all attempts keep their original English text
+        // so the assembled document stays complete (dates never jump).
+        text: sections.map((s, i) => (doneMap.has(i + 1) ? doneMap.get(i + 1) : s)).join('\n\n'),
         sourceUrl: source.sourceUrl,
         fetchedAt: source.fetchedAt,
         translatedAt: new Date().toISOString(),
@@ -1749,20 +1751,30 @@ router.get('/api/changelog', async (ctx) => {
     }
 
     if (source && source.hash) {
-      // 1. Reuse a matching cached translation (may be 'partial' — some
-      //    sections still in English while the background pass keeps going).
+      // 1. Reuse a matching cached translation when it covers ALL current
+      //    sections (may be 'partial' if some sections were persisted as
+      //    English after repeated failures). Blobs written by older code
+      //    (no `sections` array) or with gaps are NOT treated as final —
+      //    the resumable pass below fills them in.
+      const sectionCount = (() => {
+        let s = splitChangelogSections(source.text);
+        if (s.length <= 1) s = splitLongText(source.text);
+        return s.length;
+      })();
       const zh = await getCachedTranslation(source.hash, 'changelog/cached_zh');
-      if (zh) {
+      const blobComplete = zh && Array.isArray(zh.sections) && zh.sections.length >= sectionCount;
+      if (blobComplete) {
         ctx.set('Cache-Control', 'no-store');
         ctx.body = { changelog: zh, durationMs: Date.now() - startedAt };
         return;
       }
-      // 2. No usable translation. Run ONE resumable pass INLINE, bounded by
-      //    SECTION_BUDGET_MS so the request stays well under EdgeOne's ~30s
-      //    function cap. Each pass translates a few sections and persists
-      //    them; the client polls and the next request resumes from there.
-      //    Never wait on the full changelog in a single call — the gateway
-      //    takes ~8-10s per section, far too slow to finish inline.
+      // 2. No usable / incomplete translation. Run ONE resumable pass INLINE,
+      //    bounded by SECTION_BUDGET_MS so the request stays well under
+      //    EdgeOne's ~30s function cap. Each pass translates a few sections
+      //    and persists them; the client polls and the next request resumes
+      //    from there. Never wait on the full changelog in a single call —
+      //    the gateway takes ~8-10s per section, far too slow to finish
+      //    inline.
       if (llmConfigured()) {
         const lastPass = source.passStartedAt ? Date.parse(source.passStartedAt) : 0;
         if (!Number.isFinite(lastPass) || Date.now() - lastPass > PASS_THROTTLE_MS) {
@@ -1771,9 +1783,11 @@ router.get('/api/changelog', async (ctx) => {
           await runTranslationPass(source, 'changelog', 'changelog/cached_zh');
         }
         // Re-read after the pass — it may have finished (or partially
-        // finished) the translation within this request.
+        // finished) the translation within this request. Serve anything with
+        // real progress; a fully-English blob (status 'pending') keeps the
+        // client polling.
         const zhAfter = await getCachedTranslation(source.hash, 'changelog/cached_zh');
-        if (zhAfter) {
+        if (zhAfter && (zhAfter.translationStatus === 'done' || zhAfter.translationStatus === 'partial')) {
           ctx.set('Cache-Control', 'no-store');
           ctx.body = { changelog: zhAfter, durationMs: Date.now() - startedAt };
           return;
