@@ -1,25 +1,25 @@
 @import "tailwindcss";
 
 :root {
-  --background: #000000;
-  --foreground: #ffffff;
-  --card: #111111;
-  --card-foreground: #ffffff;
-  --popover: #111111;
-  --popover-foreground: #ffffff;
-  --primary: #1c66e5;
+  --background: #f7f8fc;
+  --foreground: #18181b;
+  --card: #ffffff;
+  --card-foreground: #18181b;
+  --popover: #ffffff;
+  --popover-foreground: #18181b;
+  --primary: #2563eb;
   --primary-foreground: #ffffff;
-  --secondary: #1a1a1a;
-  --secondary-foreground: #ffffff;
-  --muted: #1a1a1a;
-  --muted-foreground: #a1a1aa;
-  --accent: #1a1a1a;
-  --accent-foreground: #ffffff;
-  --destructive: #ef4444;
+  --secondary: #f1f5f9;
+  --secondary-foreground: #18181b;
+  --muted: #f1f5f9;
+  --muted-foreground: #64748b;
+  --accent: #eef2ff;
+  --accent-foreground: #1e293b;
+  --destructive: #dc2626;
   --destructive-foreground: #ffffff;
-  --border: #2a2a2a;
-  --input: #2a2a2a;
-  --ring: #1c66e5;
+  --border: #e2e8f0;
+  --input: #e2e8f0;
+  --ring: #2563eb;
 }
 
 @theme inline {
@@ -56,63 +56,81 @@ body {
 }
 
 /* ---- Animated flowing background ----
-   Three soft drifting blobs + a radial glow + grid overlay. Pure CSS
-   transforms/animations so it stays GPU-friendly and never blocks the
-   main thread. `will-change: transform` keeps the layers on the compositor. */
+   Light theme: several large soft color fields (pink / indigo / sky /
+   amber) drift very slowly and heavily blurred, like slow light streams.
+   Pure CSS transforms/animations so it stays GPU-friendly and never blocks
+   the main thread. `will-change: transform` keeps the layers on the
+   compositor. */
 .blob {
   position: absolute;
   border-radius: 9999px;
-  filter: blur(70px);
-  opacity: 0.45;
+  filter: blur(90px);
+  opacity: 0.55;
   will-change: transform;
   pointer-events: none;
 }
 
 .blob-1 {
-  width: 38vw;
-  height: 38vw;
-  top: -10vw;
-  left: -8vw;
-  background: radial-gradient(circle at 30% 30%, #1c66e5, transparent 70%);
-  animation: drift1 22s ease-in-out infinite alternate;
+  width: 42vw;
+  height: 42vw;
+  top: -12vw;
+  left: -10vw;
+  background: radial-gradient(circle at 30% 30%, #f472b6, transparent 70%);
+  animation: drift1 36s ease-in-out infinite alternate;
 }
 
 .blob-2 {
-  width: 30vw;
-  height: 30vw;
-  top: 30vh;
-  right: -10vw;
-  background: radial-gradient(circle at 60% 40%, #7c3aed, transparent 70%);
-  opacity: 0.32;
-  animation: drift2 28s ease-in-out infinite alternate;
+  width: 34vw;
+  height: 34vw;
+  top: 26vh;
+  right: -12vw;
+  background: radial-gradient(circle at 60% 40%, #818cf8, transparent 70%);
+  opacity: 0.48;
+  animation: drift2 44s ease-in-out infinite alternate;
 }
 
 .blob-3 {
-  width: 34vw;
-  height: 34vw;
-  bottom: -12vw;
-  left: 25vw;
-  background: radial-gradient(circle at 50% 50%, #0ea5e9, transparent 70%);
-  opacity: 0.28;
-  animation: drift3 25s ease-in-out infinite alternate;
+  width: 38vw;
+  height: 38vw;
+  bottom: -14vw;
+  left: 22vw;
+  background: radial-gradient(circle at 50% 50%, #38bdf8, transparent 70%);
+  opacity: 0.5;
+  animation: drift3 40s ease-in-out infinite alternate;
+}
+
+.blob-4 {
+  width: 26vw;
+  height: 26vw;
+  top: 52vh;
+  left: 12vw;
+  background: radial-gradient(circle at 50% 50%, #fbbf24, transparent 70%);
+  opacity: 0.4;
+  animation: drift4 50s ease-in-out infinite alternate;
 }
 
 @keyframes drift1 {
   0%   { transform: translate(0, 0) scale(1); }
-  50%  { transform: translate(8vw, 6vh) scale(1.08); }
-  100% { transform: translate(-4vw, 10vh) scale(0.96); }
+  50%  { transform: translate(9vw, 7vh) scale(1.1); }
+  100% { transform: translate(-5vw, 11vh) scale(0.95); }
 }
 
 @keyframes drift2 {
   0%   { transform: translate(0, 0) scale(1); }
-  50%  { transform: translate(-6vw, 8vh) scale(1.1); }
-  100% { transform: translate(5vw, -4vh) scale(0.94); }
+  50%  { transform: translate(-7vw, 9vh) scale(1.12); }
+  100% { transform: translate(6vw, -5vh) scale(0.93); }
 }
 
 @keyframes drift3 {
   0%   { transform: translate(0, 0) scale(1); }
-  50%  { transform: translate(6vw, -8vh) scale(1.06); }
-  100% { transform: translate(-8vw, 4vh) scale(1.1); }
+  50%  { transform: translate(7vw, -9vh) scale(1.08); }
+  100% { transform: translate(-9vw, 5vh) scale(1.12); }
+}
+
+@keyframes drift4 {
+  0%   { transform: translate(0, 0) scale(1); }
+  50%  { transform: translate(-8vw, 6vh) scale(1.14); }
+  100% { transform: translate(5vw, -8vh) scale(0.94); }
 }
 
 /* Respect reduced-motion preferences: freeze the blobs in place. */
@@ -122,19 +140,19 @@ body {
   }
 }
 
-/* Slightly nicer scrollbars in the dark theme. */
+/* Slightly nicer scrollbars in the light theme. */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.15) transparent;
+  scrollbar-color: rgba(15, 23, 42, 0.18) transparent;
 }
 *::-webkit-scrollbar {
   width: 8px;
   height: 8px;
 }
 *::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.12);
+  background: rgba(15, 23, 42, 0.14);
   border-radius: 9999px;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.22);
+  background: rgba(15, 23, 42, 0.26);
 }
