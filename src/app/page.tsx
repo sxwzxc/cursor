@@ -100,6 +100,17 @@ const PLATFORMS = [
   { id: "linux-x64", label: "Linux x64", desc: "AppImage" },
 ];
 
+// Suggested names for the save dialog. The real file name (with version) only
+// becomes known after the manifest fetch, but the dialog must open
+// synchronously inside the click handler, so we pre-fill a platform-accurate
+// default the user can rename.
+const DEFAULT_FILE_NAMES: Record<string, string> = {
+  "win32-x64-user": "CursorSetup-x64.exe",
+  "darwin-arm64": "Cursor-darwin-arm64.dmg",
+  "darwin-x64": "Cursor-darwin-x64.dmg",
+  "linux-x64": "Cursor-x64.AppImage",
+};
+
 function formatBytes(bytes: number): string {
   if (!bytes || bytes <= 0) return "—";
   const units = ["B", "KB", "MB", "GB"];
@@ -267,6 +278,40 @@ export default function Home() {
     const uiTimer = setInterval(paint, 250);
 
     try {
+      // 0. Ask where to save IMMEDIATELY. showSaveFilePicker must run
+      // synchronously inside the click's user-gesture stack (before any
+      // await), otherwise Chrome throws "Must be handling a user gesture to
+      // show a file picker". The real file name comes from the manifest, so
+      // we suggest a platform default the user can rename in the dialog.
+      // Browsers without the File System Access API skip this and fall back
+      // to Blob + <a download> at the end.
+      const w = window as unknown as {
+        showSaveFilePicker?: (opts: {
+          suggestedName?: string;
+          types?: { description?: string; accept: Record<string, string[]> }[];
+        }) => Promise<FileSystemFileHandle>;
+      };
+      let saveHandle: FileSystemFileHandle | null = null;
+      if (typeof w.showSaveFilePicker === "function") {
+        try {
+          saveHandle = await w.showSaveFilePicker({
+            suggestedName: DEFAULT_FILE_NAMES[platform] || "Cursor Installer",
+            types: [
+              {
+                description: "Installer",
+                accept: { "application/octet-stream": [".exe", ".dmg", ".AppImage"] },
+              },
+            ],
+          });
+        } catch (e) {
+          if (e instanceof DOMException && e.name === "AbortError") {
+            // User cancelled — nothing has been downloaded yet.
+            return;
+          }
+          throw e;
+        }
+      }
+
       // 1. Fetch the manifest describing how to reassemble the installer.
       const manifestResp = await fetch(`/koa/api/download-manifest?platform=${platform}`);
       const manifest = await manifestResp.json();
@@ -331,38 +376,14 @@ export default function Home() {
         return buf;
       });
 
-      // 3. Download complete (100%) — NOW ask where to save.
+      // 3. Download complete (100%) — write the chunks into the file the user
+      // picked in step 0. Browsers without the File System Access API fall
+      // back to Blob + <a download> (no dialog; saves to the Downloads dir).
       clearInterval(uiTimer);
       paint();
       setSaving(true);
-      const w = window as unknown as {
-        showSaveFilePicker?: (opts: {
-          suggestedName?: string;
-          types?: { description?: string; accept: Record<string, string[]> }[];
-        }) => Promise<FileSystemFileHandle>;
-      };
-      if (typeof w.showSaveFilePicker === "function") {
-        let handle: FileSystemFileHandle;
-        try {
-          handle = await w.showSaveFilePicker({
-            suggestedName: fileName,
-            types: [
-              {
-                description: "Installer",
-                accept: { "application/octet-stream": [".exe", ".dmg", ".AppImage"] },
-              },
-            ],
-          });
-        } catch (e) {
-          if (e instanceof DOMException && e.name === "AbortError") {
-            // User cancelled the save dialog — the download itself succeeded.
-            setSaving(false);
-            setDownloadNotice("下载已完成，但未选择保存位置。");
-            return;
-          }
-          throw e;
-        }
-        const writable = await (handle as unknown as { createWritable: () => Promise<FileSystemWritableFileStream> }).createWritable();
+      if (saveHandle) {
+        const writable = await (saveHandle as unknown as { createWritable: () => Promise<FileSystemWritableFileStream> }).createWritable();
         try {
           for (const part of ordered) await writable.write(part);
           await writable.close();
