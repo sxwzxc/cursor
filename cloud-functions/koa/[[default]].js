@@ -6,12 +6,13 @@ import { getStore } from '@edgeone/pages-blob';
 // ---------- Configuration ----------
 
 const STORE_NAME = 'cursor-cache';
-// 6 MB per chunk — comfortably below the 25 MB single-blob limit, and small
-// enough that one chunk downloads in ~3s even on a ~2 MB/s egress (EdgeOne ->
-// cursor.com observed bandwidth). This keeps each /api/update-step call well
-// under EdgeOne's ~30s function execution cap, with room for retries.
-// 199 MB installer -> ~34 chunks.
-const CHUNK_SIZE = 6 * 1024 * 1024;
+// 10 MB per chunk — below the 25 MB single-blob limit, and small enough that
+// one chunk downloads in ~5s even on a ~2 MB/s egress (EdgeOne -> cursor.com
+// observed bandwidth). 8-way concurrency is the most the 128 MB function
+// memory cap allows for 10 MB chunks (~80 MB of in-flight buffers + runtime),
+// and a single /api/update-step batch stays well under EdgeOne's ~30s
+// execution cap. 199 MB installer -> ~19 chunks.
+const CHUNK_SIZE = 10 * 1024 * 1024;
 
 // Cursor official "golden" download API.
 // The path ends with `cursor/` (no version pin) — this always redirects to the
@@ -264,9 +265,10 @@ async function downloadSingleChunk(platform, url, index, totalSize, chunkSize) {
   const expected = end - start + 1;
 
   let buf = null;
-  // 8s per-attempt timeout. With 6 MB chunks at ~2 MB/s, a normal download
-  // takes ~3s, so this only fires on genuine stalls.
-  const FETCH_TIMEOUT_MS = 8000;
+  // 12s per-attempt timeout. With 10 MB chunks at ~2 MB/s, a normal download
+  // takes ~5s, so this only fires on genuine stalls (worst case header+body
+  // still fits under EdgeOne's ~30s execution cap).
+  const FETCH_TIMEOUT_MS = 12000;
   try {
     const resp = await fetchWithTimeout(url, {
       method: 'GET',
@@ -1100,13 +1102,13 @@ router.get('/api/check', async (ctx) => {
   ctx.body = { latest, cached, needsUpdate, reason, warning, durationMs: Date.now() - startedAt };
 });
 
-// Per-step update — downloads a BATCH of chunks (default 4, parallel) per
+// Per-step update — downloads a BATCH of chunks (default 8, parallel) per
 // invocation. This is the endpoint the frontend calls in a loop: it dodges
 // the EdgeOne function execution-time cap (~30s) and gives natural progress
-// reporting. Each batch of 4 × 6 MB downloads in ~3-15s, well under the cap.
+// reporting. Each batch of 8 × 10 MB downloads in ~5-25s, under the cap.
 //
 // Query params:
-//   count=<n>  chunks to download concurrently per call (default 4, max 8)
+//   count=<n>  chunks to download concurrently per call (default 8, max 8)
 //
 // State machine (persisted in meta/{platform}):
 //   - No meta, or meta.commit != latest.commit, or force:
@@ -1123,7 +1125,7 @@ router.get('/api/check', async (ctx) => {
 router.post('/api/update-step', async (ctx) => {
   const platform = ctx.query.platform;
   const force = ctx.query.force === 'true' || ctx.query.force === '1';
-  const count = Math.min(Math.max(parseInt(ctx.query.count, 10) || 4, 1), 8);
+  const count = Math.min(Math.max(parseInt(ctx.query.count, 10) || 8, 1), 8);
   if (!isValidPlatform(platform)) {
     ctx.status = 400;
     ctx.body = { error: 'invalid_platform' };
@@ -1274,7 +1276,7 @@ async function resumeDownload(platform, cached, startedAt, latest, count) {
 
   let batch;
   try {
-    batch = await downloadChunksInParallel(platform, cached, count || 4);
+    batch = await downloadChunksInParallel(platform, cached, count || 8);
   } catch (e) {
     // Return action='retry' (HTTP 200) so the frontend loops again.
     return {
@@ -1444,11 +1446,11 @@ router.post('/api/auto-update', async (ctx) => {
   }
 
   // ---- Phase 2: Download chunks within the time budget ----
-  // Chunks are downloaded in parallel batches (4 at a time) so each 25s call
-  // advances the download ~4× faster than one chunk at a time. Chunks that
+  // Chunks are downloaded in parallel batches (8 at a time) so each 25s call
+  // advances the download ~8× faster than one chunk at a time. Chunks that
   // fail in this invocation are skipped (not retried) so the next batch can
   // make progress on other chunks; they are picked up by the following call.
-  const BATCH_CONCURRENCY = 4;
+  const BATCH_CONCURRENCY = 8;
   let chunksDownloadedThisCall = 0;
   let consecutiveFailures = 0;
   let lastError = null;
